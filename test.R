@@ -1,5 +1,12 @@
 # Load the file and assign it to a variable named 'my_data'
 handwriting <- readRDS("handwriting.rds")
+dim(handwriting$images)
+
+
+library(keras3)
+use_backend("tensorflow")
+x <- handwriting$images / 255
+y_person <- handwriting$metadata$person_id - 1L
 
 # View the imported data frame
 View(handwriting)
