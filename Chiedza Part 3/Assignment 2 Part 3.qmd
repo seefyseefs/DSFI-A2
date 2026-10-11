@@ -1,0 +1,316 @@
+---
+title: "DS4I Part 3"
+author: "SGRCHI001"
+format: typst
+editor: visual
+---
+
+```{r}
+data <- readRDS("handwriting.rds")
+str(data)
+
+dim(data$images) # 25000 x 28 x 28 x 1
+head(data$metadata)
+```
+
+## Part 3 - Writer Verification using a Siamese Network
+
+### Objective
+
+The aim of this task is to determine whether two handwriting images were written by the same person.
+
+Unlike the CNN in Task 2, which predicts one of 20 writers, the Siamese network learns a similarity function. Given two images, the network outputs the probability that both images belong to the same writer.
+
+This transforms writer identification into a binary classification problem:
+
+Same writer = 1; Different writer = 0
+
+#### Step 1 - Create training and testing sets
+
+To check whether the model could recognise a writer's handwriting in a new session, we trained it on images from Sessions 1-4 and tested it on images from Session 5. This showed whether the model could identify the same writer from handwriting samples it had never seen before. This avoids information leakage and creates a realistic evaluation framework.
+
+```{r}
+library(dplyr)
+
+metadata <- data$metadata
+
+# Training images
+train_idx <- which(metadata$session %in% c(1,2,3,4))
+
+# Test images
+test_idx <- which(metadata$session == 5)
+
+train_meta <- metadata[train_idx,]
+test_meta <- metadata[test_idx,]
+
+dim(train_meta)
+dim(test_meta)
+```
+
+#### Step 2 - Construct Positive and Negative Pairs
+
+The Siamese network was trained using pairs of handwriting images. Pairs containing two samples from the same writer were labelled as **1**, while pairs containing samples from different writers were labelled as **0**. By learning from these pairs, the model focused on identifying how similar two handwriting samples were, rather than learning to recognise specific writers directly.
+
+```{r}
+#Positive Pair Function
+create_positive_pairs <- function(meta)
+{
+  pairs <- list()
+  
+  for(writer in unique(meta$person_id))
+  {
+    writer_rows <- which(meta$person_id == writer)
+    
+    # Random subset to avoid huge number of pairs
+    sampled_rows <- sample(writer_rows,
+                           min(50,length(writer_rows)))
+    
+    combs <- t(combn(sampled_rows,2))
+    
+    pairs[[as.character(writer)]] <- data.frame(img1 = combs[,1],
+                                                img2 = combs[,2],
+                                                label = 1)
+  }
+  
+  bind_rows(pairs)
+}
+
+#Negative Pair Function
+create_negative_pairs <- function(meta, n_pairs)
+{
+  negative_pairs <- data.frame()
+  
+  for(i in 1:n_pairs)
+  {
+    img1 <- sample(1:nrow(meta),1)
+    
+    writer1 <- meta$person_id[img1]
+    
+    img2 <- sample(
+      which(meta$person_id != writer1),
+      1
+    )
+    
+    negative_pairs <- rbind(negative_pairs,
+                            data.frame(img1 = img1,
+                                       img2 = img2,
+                                       label = 0))
+  }
+  
+  negative_pairs
+}
+
+#Create Training Pairs
+train_positive <- create_positive_pairs(train_meta)
+
+train_negative <- create_negative_pairs(train_meta, 
+                                        nrow(train_positive))
+
+train_pairs <- rbind(train_positive, train_negative)
+
+#Create Test Pairs
+test_positive <- create_positive_pairs(test_meta)
+
+test_negative <- create_negative_pairs(test_meta,
+                                       nrow(test_positive))
+
+test_pairs <- rbind(test_positive, test_negative)
+
+```
+
+#### Step 3 - Create Siamese Inputs
+
+Keras requires two input arrays: Input A and Input B; and one output: Same writer?
+
+```{r}
+#Training images:
+
+train_images <- data$images[train_idx,,,, drop = FALSE]
+test_images  <- data$images[test_idx,,,, drop = FALSE]
+
+# Normalise
+train_images <- train_images / 255
+test_images  <- test_images / 255
+
+dim(train_images)
+dim(test_images)
+
+#Build Pair Arrays
+build_pair_arrays <- function(images, pairs)
+{
+  x1 <- images[pairs$img1,,,, drop = FALSE]
+  x2 <- images[pairs$img2,,,, drop = FALSE]
+  
+  y <- pairs$label
+  
+  list(x1 = x1,
+       x2 = x2,
+       y = y)
+}
+
+train_data_pairs <- build_pair_arrays(train_images, train_pairs)
+
+test_data_pairs <- build_pair_arrays(test_images, test_pairs)
+
+```
+
+#### Step 4 - Build the Siamese Network
+
+Both branches use exactly the same CNN.
+
+The encoder learns writer-specific features such as:
+
+stroke thickness, digit shape, slant, curvature and spacing patterns
+
+The network then compares feature representations.
+
+```{r}
+#Encoder
+#install.packages("keras3")
+library(keras3)
+library(reticulate)
+
+py_require("tensorflow")
+use_backend("tensorflow")
+tensorflow::tf_version()
+
+# Shared Encoder
+encoder <- create_encoder()
+
+input_a <- layer_input(shape = c(28,28,1))
+input_b <- layer_input(shape = c(28,28,1))
+
+encoded_a <- encoder(input_a)
+encoded_b <- encoder(input_b)
+
+# Euclidean Distance Function
+euclidean_distance <- function(vectors)
+{
+  x <- vectors[[1]]
+  y <- vectors[[2]]
+  
+  op_sqrt(
+    op_sum(
+      op_square(x - y),
+      axis = -1,
+      keepdims = TRUE
+    )
+  )
+}
+
+# Distance Layer
+distance <- layer_lambda(list(encoded_a, encoded_b),
+                         euclidean_distance)
+
+# Create Siamese Model
+siamese_model <- keras_model(inputs = list(input_a, input_b),
+                             outputs = distance)
+
+# Contrastive Loss
+contrastive_loss <- function(y_true, y_pred)
+{
+  margin <- 1
+  
+  op_mean(
+    y_true * op_square(y_pred) +
+      (1 - y_true) *
+      op_square(
+        op_maximum(margin - y_pred, 0)
+      )
+  )
+}
+
+# Compile Model
+siamese_model |> compile(optimizer = optimizer_adam(),
+                         loss = contrastive_loss)
+
+# View architecture
+summary(siamese_model)
+
+#dim(train_data_pairs$x1)
+#dim(train_data_pairs$x2)
+#length(train_data_pairs$y)
+```
+
+#### Step 5 - Train The Model
+
+```{r}
+options(keras.view_metrics = FALSE)
+
+history <- siamese_model |> 
+  fit(x = list(train_data_pairs$x1,train_data_pairs$x2),
+      y = train_data_pairs$y,
+      validation_data = list(list(test_data_pairs$x1,
+                                  test_data_pairs$x2),
+                             test_data_pairs$y),
+      epochs = 10,
+      batch_size = 64)
+
+plot(history)
+
+```
+
+The graph shows:
+
+-  The red line (training loss) decreases very quickly from about 0.06 to almost 0.00.
+
+- The blue line (validation loss) increases from about 0.13 to around 0.20 and then remains fairly stable.
+
+The Siamese network is learning the training pairs extremely well - Training loss decreases steadily across all epochs. By Epoch 4, the training loss is almost zero. However, the model does not perform as well on unseen data. Validation loss increases during the first few epochs. Validation loss remains much higher than training loss. This pattern suggests overfitting. The model has learned the specific patterns in the training pairs very well, but those patterns do not generalise equally well to handwriting samples it has not seen before. The network is becoming highly specialised to the training data, while its performance on unseen handwriting samples is not improving.
+
+#### Step 6 - Evaluate The Model
+
+```{r}
+library(caret)
+
+pred_distances <- predict(siamese_model,
+                          list(test_data_pairs$x1,
+                               test_data_pairs$x2))
+
+#Convert distances into same/different writer predictions:
+threshold <- 0.5
+
+pred_class <- ifelse(pred_distances < threshold, 1, 0)
+
+cm <- confusionMatrix(factor(pred_class),
+                      factor(test_data_pairs$y, levels = c(0, 1)),
+                      positive = "1")
+
+cm
+
+accuracy <- cm$overall["Accuracy"]
+
+precision <- cm$byClass["Pos Pred Value"]
+
+recall <- cm$byClass["Sensitivity"]
+
+specificity <- cm$byClass["Specificity"]
+
+f1_score <- 2 * (precision * recall) /
+  (precision + recall)
+
+data.frame(
+  Accuracy = accuracy,
+  Precision = precision,
+  Recall = recall,
+  Specificity = specificity,
+  F1_Score = f1_score
+)
+
+library(pROC)
+
+roc_obj <- roc(
+  response = test_data_pairs$y,
+  predictor = as.vector(-pred_distances)
+)
+
+plot(
+  roc_obj,
+  col = "blue",
+  main = "ROC Curve"
+)
+
+auc(roc_obj)
+
+
+```
