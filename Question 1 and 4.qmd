@@ -18,7 +18,7 @@ execute:
 ```{r setup}
 library(keras3)
 library(tidyverse)
-
+use_backend("tensorflow")
 
 data <- readRDS("handwriting.rds")
 x_scaled <- data$images / 255
@@ -46,6 +46,31 @@ plot_panels <- function(df) {
     theme(legend.position = "none",
           strip.text = element_text(face = "bold"))
 }
+
+
+x_all <- data$images / 255
+y_all_person <- data$metadata$person_id - 1 # 0-indexed for Keras
+
+#create partitions
+train_rows <- which(data$metadata$session %in% c(1, 2, 3))
+val_rows   <- which(data$metadata$session == 4)
+test_rows  <- which(data$metadata$session == 5)
+
+# --- Partition Images (x) ---
+x_train <- x_all[train_rows, , , , drop = FALSE]
+x_val   <- x_all[val_rows, , , , drop = FALSE]
+x_test  <- x_all[test_rows, , , , drop = FALSE]
+
+# --- Partition Writer IDs for CNN (y) ---
+y_train_person <- y_all_person[train_rows]
+y_val_person   <- y_all_person[val_rows]
+y_test_person  <- y_all_person[test_rows]
+
+# --- Partition Metadata (for Siamese Pair Construction) ---
+meta_train <- data$metadata[train_rows, ]
+meta_val   <- data$metadata[val_rows, ]
+meta_test  <- data$metadata[test_rows, ]
+
 ```
 
 ## Section 1: Exploratory Data Analysis 
