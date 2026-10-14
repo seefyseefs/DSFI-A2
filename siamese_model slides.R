@@ -37,12 +37,12 @@ make_pairs <- function(ids, n, class_labels = person) {
     pool <- ids[class_labels[ids] == class_labels[i]]
     if (!same) pool <- ids[class_labels[ids] != class_labels[i]]
     pool <- setdiff(pool, i)
-    pool[sample.int(length(pool), 1)]   # safe even if pool has length 1
+    pool[sample.int(length(pool), 1)]   
   }, integer(1))
   cbind(a, b)
 }
 
-# Slide 27: turn index pairs into left/right image arrays + y (1 = same writer)
+# Slide 27:
 make_batch <- function(p, images = x, class_labels = person) {
   y <- matrix(as.integer(class_labels[p[, 1]] == class_labels[p[, 2]]), ncol = 1)
   list(
@@ -64,8 +64,6 @@ mean(train$y); mean(valid$y); mean(test$y)   # should all be about 0.5
 
 # -----------------------------------------------------------------------------
 # 3. Shared encoder (slide 28)
-# Identifying writers is harder than identifying digits, so this encoder is a
-# bit wider than the slide version (32/64/64 filters, 32-d embedding).
 # -----------------------------------------------------------------------------
 image <- layer_input(shape = c(28, 28, 1))
 z <- image |>
@@ -77,14 +75,6 @@ z <- image |>
   layer_global_average_pooling_2d() |>
   layer_dense(32)
 encoder <- keras_model(image, z)
-
-# Slide-exact version, if you'd rather match the notes precisely:
-# z <- image |>
-#   layer_conv_2d(16, 3, activation = "relu") |>
-#   layer_max_pooling_2d(2) |>
-#   layer_conv_2d(32, 3, activation = "relu") |>
-#   layer_global_average_pooling_2d() |>
-#   layer_dense(16)
 
 # -----------------------------------------------------------------------------
 # 4. Siamese model: both images go through the SAME encoder (slide 29)
