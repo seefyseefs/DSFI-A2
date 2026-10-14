@@ -59,9 +59,6 @@ test  <- make_batch(pairs_test)
 
 mean(train$y); mean(valid$y); mean(test$y)   # should all be about 0.5
 
-
-
-
 # -----------------------------------------------------------------------------
 # 1. A function that builds and trains one  Siamese model.
 #    only two things change:
