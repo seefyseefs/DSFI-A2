@@ -1,0 +1,539 @@
+---
+title: "Handwriting Analysis: Exploratory Data Analysis & Experimental Setup"
+subtitle: "Questions 1 and 4 Complete Report"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    theme: cosmo
+    embed-resources: true
+    code-fold: false
+engine: knitr
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r setup}
+library(keras3)
+library(tidyverse)
+library(dplyr)
+library(knitr)
+library(caret)
+library(pROC)
+library(reticulate)
+py_require(python_version = "3.12")
+use_backend("tensorflow")
+set.seed(20260923)
+
+data <- readRDS("handwriting.rds")
+x_scaled <- data$images / 255
+
+
+get_image_df <- function(index, label_text) {
+  img_matrix <- x_scaled[index, , , 1]
+  as.data.frame(as.table(img_matrix)) |>
+    rename(Y = Var1, X = Var2, Intensity = Freq) |>
+    mutate(
+      X = as.numeric(X),
+      Y = 29 - as.numeric(Y), # flip Y axis so digits render right-side up
+      PanelLabel = label_text
+    )
+}
+
+
+plot_panels <- function(df) {
+  ggplot(df, aes(x = X, y = Y, fill = Intensity)) +
+    geom_tile() +
+    facet_wrap(~ PanelLabel, nrow = 1) +
+    scale_fill_gradient(low = "white", high = "black") +
+    coord_fixed() +
+    theme_void(base_size = 14) +
+    theme(legend.position = "none",
+          strip.text = element_text(face = "bold"))
+}
+
+
+x_all <- data$images / 255
+y_all_person <- data$metadata$person_id - 1 # 0-indexed for Keras
+
+#create partitions
+train_rows <- which(data$metadata$session %in% c(1, 2, 3))
+val_rows   <- which(data$metadata$session == 4)
+test_rows  <- which(data$metadata$session == 5)
+
+# --- Partition Images (x) ---
+x_train <- x_all[train_rows, , , , drop = FALSE]
+x_val   <- x_all[val_rows, , , , drop = FALSE]
+x_test  <- x_all[test_rows, , , , drop = FALSE]
+
+# --- Partition Writer IDs for CNN (y) ---
+y_train_person <- y_all_person[train_rows]
+y_val_person   <- y_all_person[val_rows]
+y_test_person  <- y_all_person[test_rows]
+
+meta <- data$metadata
+
+person  <- meta$person_id               # the "class label" for the Siamese task
+session <- meta$session
+digit   <- meta$digit
+
+```
+
+## Section 1: Exploratory Data Analysis 
+
+### Global Dataset Profile overview
+The handwriting dataset evaluated in this study constitutes a completely uniform, synthetically balanced array designed for writer identification and verification tasks. It contains a total population of 25,000 unique images mapped across a multi-dimensional recording matrix. The underlying data distribution is structured as follows:
+
+- **Writers (20):** Represented by `person_id` ranging from 1 to 20.
+- **Characters (5):** Represented by `digit` spanning 0 to 4.
+- **Temporal Intervals (5):** Represented by `session` tracking blocks 1 to 5.
+- **Replicate Volume (50):** Represented by `replicate` indicating repeated frames from 1 to 50 captured sequentially within a single sitting.
+
+The data collection is entirely free from any structural class imbalances as it  contains exactly 50 replicates for every single intersecting combination of person, digit, and session ($20 \times 5 \times 5 \times 50 = 25,000$). This perfect alignment avoids standard sampling biases,thus overall  accuracy metrics will remain uninflated by majority-class dominance.
+
+
+The raw data image is formatted as integer elements ranging from 0 (representing the blank background canvas) to 255 (representing the maximum ink density path). The image pixel values were  scaled to [0,1] before fitting the models as it will cause numerical instability during early backpropagation rounds. (this paragraph could probably be moved to the end of q1)
+
+Moreover, each person has a consistent handwriting style, but their writing style fluctuates between the 5 recording  due to various factors - different writing materials or natural variation. 
+
+### Analysis of Visible Sources of Variation
+
+
+#### Inter-Writer Style Variation 
+
+In order to examine the inter-writer style variation the single character class (digit 0) across the first 5 writers is analysed in the figure below. It is evident that there is a clear variation in the writing style of each writer. For instance, writer 1's character leans towards the left with an asymmetrical top loop whereas writer 2 produces uniform stroke borders with flat horizontal loops. Furthermore, writer 3 produces a small, pinched dense circle unlike writers 4 and 5 with larger round circles where writer 4 is less symmetrical than writer 5. These differences act as key identity signals that convolutional filters can easily latch onto to identify writers. 
+
+
+```{r fig-inter-writer}
+#| fig-cap: "Digit 0 written by Writers 1 to 5 (inter-writer style variation)"
+#| fig-width: 9
+#| fig-height: 2.5
+rows <- which(data$metadata$digit == 0 & data$metadata$session == 1 &
+              data$metadata$replicate == 1 & data$metadata$person_id %in% 1:5)
+df <- bind_rows(
+  get_image_df(rows[1], "Writer 1"),
+  get_image_df(rows[2], "Writer 2"),
+  get_image_df(rows[3], "Writer 3"),
+  get_image_df(rows[4], "Writer 4"),
+  get_image_df(rows[5], "Writer 5")
+)
+plot_panels(df)
+```
+
+#### Consistent Individual Handwriting Signatures 
+When tracking multiple characters produced by a single hand, a cohesive, cross-character fingerprint becomes apparent. For example, evaluating Writer 1 the writer maintains a perfectly upright, non-slanted angle across all stroke length. Conversely, when evaluating writer 10 in session 5 it is evident that the writer sustains a slanted angle to the right across all digits. This verifies that personal writing styles carry over into different character geometries. 
+
+```{r fig-character-profile}
+#| fig-cap: "Digits 0 to 4 written by Writer 1 (consistent individual signature)"
+#| fig-width: 9
+#| fig-height: 2.5
+rows <- which(data$metadata$person_id == 1 & data$metadata$session == 1 &
+              data$metadata$replicate == 1)
+df <- bind_rows(
+  get_image_df(rows[1], "Digit 0"),
+  get_image_df(rows[2], "Digit 1"),
+  get_image_df(rows[3], "Digit 2"),
+  get_image_df(rows[4], "Digit 3"),
+  get_image_df(rows[5], "Digit 4")
+)
+plot_panels(df)
+```
+
+```{r fig-character-profile 2}
+#| fig-cap: "Digits 0 to 4 written by Writer 10 (consistent individual signature)"
+#| fig-width: 9
+#| fig-height: 2.5
+rows <- which(data$metadata$person_id == 10 & data$metadata$session == 5 &
+              data$metadata$replicate == 1)
+df <- bind_rows(
+  get_image_df(rows[1], "Digit 0"),
+  get_image_df(rows[2], "Digit 1"),
+  get_image_df(rows[3], "Digit 2"),
+  get_image_df(rows[4], "Digit 3"),
+  get_image_df(rows[5], "Digit 4")
+)
+plot_panels(df)
+```
+#### Temporal Session Drift 
+In examining the consistency of writer style across different sessions it is evident that there is subtle variability over time.It is evident for writer 1 that the style of the digit 2 written varies throughout all sessions 5. In Sessions 3 and 4, the upper curvature of Digit 2 becomes compressed and shortened compared to the expansive, loops drawn in Sessions 1,2 and 4. This successfully mimics operational variations, such as hand fatigue, changing writing speeds, or pen being used. 
+
+```{r fig-temporal-drift}
+#| fig-cap: "Digit 2 by Writer 1 across Sessions 1 to 5 (temporal drift)"
+#| fig-width: 9
+#| fig-height: 2.5
+rows <- which(data$metadata$person_id == 1 & data$metadata$digit == 2 &
+              data$metadata$replicate == 1)
+df <- bind_rows(
+  get_image_df(rows[1], "Session 1"),
+  get_image_df(rows[2], "Session 2"),
+  get_image_df(rows[3], "Session 3"),
+  get_image_df(rows[4], "Session 4"),
+  get_image_df(rows[5], "Session 5")
+)
+plot_panels(df)
+```
+
+### Limitations of the Simulated Data
+
+A critical flaw in the simulated  data is visible when examining consecutive replicates within the same session. Replicates 1 through 5 for Digit 3 appear almost completely identical down to individual pixel coordinates. However real human handwriting is inherently stochastic due to organic hand movements thus making it impossible for a human to trace an identical stroke 50 times sequentially. The absence of these variations shows that the simulation generates an artificial clean environment.
+```{r fig-replicate-jitter}
+#| fig-cap: "Digit 3 by Writer 1, Session 1, Replicates 1 to 5"
+#| fig-width: 9
+#| fig-height: 2.5
+rows <- which(data$metadata$person_id == 1 & data$metadata$digit == 3 &
+              data$metadata$session == 1 & data$metadata$replicate %in% 1:5)
+df <- bind_rows(
+  get_image_df(rows[1], "Replicate 1"),
+  get_image_df(rows[2], "Replicate 2"),
+  get_image_df(rows[3], "Replicate 3"),
+  get_image_df(rows[4], "Replicate 4"),
+  get_image_df(rows[5], "Replicate 5")
+)
+plot_panels(df)
+```
+
+## Section 3: Writer Verification using a Siamese Network
+
+### Data Preparation
+
+The handwriting images were loaded and scaled by dividing the pixel values by 255. This converted all pixel values to the range 0 to 1, which helps the neural network train more effectively. The data was split by session to avoid data leakage. Sessions 1 to 3 were used for training, session 4 for validation, and session 5 for testing.
+
+### Construction of Training Examples
+
+Training examples were created as pairs of images. For each pair, there was a 50% chance that both images came from the same writer and a 50% chance that they came from different writers.
+
+A label of 1 was assigned if the two images were written by the same person, and a label of 0 was assigned if they were written by different people. This balanced set of positive and negative pairs allowed the model to learn writer similarity.
+
+```{r tab-pairs}
+#| label: tbl-make_pairs
+#| tbl-cap: "Test Set Performance Metrics for the Siamese Network"
+make_pairs <- function(ids, n, class_labels = person) {
+  a <- sample(ids, n, replace = TRUE)
+  b <- vapply(a, function(i) {
+    same <- runif(1) < .5
+    pool <- ids[class_labels[ids] == class_labels[i]]
+    if (!same) pool <- ids[class_labels[ids] != class_labels[i]]
+    pool <- setdiff(pool, i)
+    pool[sample.int(length(pool), 1)]   
+  }, integer(1))
+  cbind(a, b)
+}
+
+# Slide 27:
+make_batch <- function(p, images = x_scaled, class_labels = person) {
+  y <- matrix(as.integer(class_labels[p[, 1]] == class_labels[p[, 2]]), ncol = 1)
+  list(
+    left  = images[p[, 1], , , , drop = FALSE],
+    right = images[p[, 2], , , , drop = FALSE],
+    y     = y
+  )
+}
+
+pairs_train <- make_pairs(train_rows, 20000)
+pairs_valid <- make_pairs(val_rows, 5000)
+pairs_test  <- make_pairs(test_rows,  5000)
+
+train <- make_batch(pairs_train)
+valid <- make_batch(pairs_valid)
+test  <- make_batch(pairs_test)
+
+#mean(train$y); mean(valid$y); mean(test$y)   # should all be about 0.5
+
+pair_summary <- data.frame(
+  Dataset = c("Training", "Validation", "Test"),
+  Number_of_Pairs = c(
+    nrow(pairs_train),
+    nrow(pairs_valid),
+    nrow(pairs_test)
+  ),
+  Positive_Pair_Proportion = round(
+    c(
+      mean(train$y),
+      mean(valid$y),
+      mean(test$y)
+    ),
+    4
+  )
+)
+
+kable(pair_summary)
+  #caption = "Summary of Siamese Network Pair Construction")
+
+```
+
+
+### Shared Encoder Network
+
+A convolutional neural network (CNN) was used as the shared encoder. The encoder consisted of three convolutional layers with ReLU activation functions and max-pooling layers for feature extraction.
+
+The encoder transformed each handwriting image into a compact feature representation that captured important writer characteristics.
+
+```{r}
+image <- layer_input(shape = c(28, 28, 1))
+z <- image |>
+  layer_conv_2d(32, 3, activation = "relu", padding = "same") |>
+  layer_max_pooling_2d(2) |>
+  layer_conv_2d(64, 3, activation = "relu", padding = "same") |>
+  layer_max_pooling_2d(2) |>
+  layer_conv_2d(64, 3, activation = "relu", padding = "same") |>
+  layer_global_average_pooling_2d() |>
+  layer_dense(32)
+encoder <- keras_model(image, z)
+
+```
+
+### Siamese Network Architecture
+
+The Siamese network contained two identical branches that shared the same encoder weights. Each branch processed one image from a pair.
+
+The feature vectors produced by the encoder were compared using Euclidean distance. Small distances indicated that the images were likely written by the same person, while larger distances suggested different writers.
+
+```{r}
+a <- layer_input(shape = c(28, 28, 1))
+b <- layer_input(shape = c(28, 28, 1))
+distance <- list(encoder(a), encoder(b)) |>
+  layer_lambda(f = function(z) {
+    op_sqrt(op_sum(op_square(z[[1]] - z[[2]]), axis = 2,
+                   keepdims = TRUE) + 1e-7)
+  })
+model <- keras_model(list(a, b), distance)
+
+```
+
+### Contrastive Loss Function
+
+The model was trained using contrastive loss with a margin of 1.
+
+For pairs from the same writer, the loss function encouraged the distance between embeddings to become smaller. For pairs from different writers, the loss function encouraged the distance to be greater than the margin. This helped the network learn a feature space where handwriting from the same writer was grouped together and handwriting from different writers was separated.
+
+```{r}
+contrastive_loss <- function(y, d) {
+  op_mean(y * op_square(d) +
+            (1 - y) * op_square(op_maximum(1 - d, 0)))
+}
+```
+
+### Model Training
+
+The model was trained using the Adam optimiser with a learning rate of 0.001. Training was performed for up to 20 epochs with a batch size of 64.
+
+Early stopping was applied using the validation loss from session 4. Training stopped automatically if the validation loss did not improve for three consecutive epochs, helping to reduce overfitting.
+
+```{r fig-training}
+#| fig-cap: "Training and validation loss of the Siamese network over training epochs."
+#| fig-width: 7
+#| fig-height: 4
+
+model |> compile(optimizer = optimizer_adam(1e-3),
+                 loss = contrastive_loss)
+
+history <- model |> 
+  fit(list(train$left, train$right), 
+      train$y,
+      validation_data = list(list(valid$left, valid$right), valid$y),
+      epochs = 10, 
+      batch_size = 64,
+      callbacks = list(callback_early_stopping(monitor = "val_loss", 
+                                               patience = 3,
+                                               restore_best_weights = TRUE)),
+      verbose = 0)
+p <- plot(history)
+
+p +
+  ggplot2::labs(
+    title = "Training and Validation Loss of the Siamese Network")
+
+```
+
+The training loss decreased steadily from approximately 0.15 to 0.04, showing that the model learned the training data effectively. The validation loss decreased initially but then remained relatively constant, suggesting that the model generalised well with only slight signs of overfitting after the first few epochs.
+
+### Threshold Selection
+
+The Siamese network outputs a distance rather than a direct same-or-different prediction. A decision threshold was therefore selected using the validation set.
+
+Distances below the threshold were classified as the same writer, while distances above the threshold were classified as different writers. The threshold that achieved the highest balanced accuracy on the validation set was chosen.
+
+```{r tab-threshold}
+#| tbl-cap: "Threshold Selection Based on Validation Set Balanced Accuracy"
+
+d_valid <- as.numeric(predict(model, list(valid$left, valid$right),
+                              verbose = 0))
+
+valid_same <- valid_same <- as.logical(valid$y[, 1])
+
+balanced_accuracy_at <- function(cut) {
+  predicts_same <- d_valid < cut
+  same_rate <- mean(predicts_same[valid_same])
+  different_rate <- mean(!predicts_same[!valid_same])
+  (same_rate + different_rate) / 2
+}
+# Candidate thresholds
+example_thresholds <- unique(
+  as.numeric(quantile(d_valid, c(0.25, 0.50, 0.75)))
+)
+
+threshold_table <- data.frame(Threshold = example_thresholds,
+                              Balanced_Accuracy = vapply(example_thresholds,
+                                                         balanced_accuracy_at,
+                                                         numeric(1)))
+
+# Optimal threshold
+threshold_candidates <- sort(unique(d_valid))
+threshold_scores <- vapply(
+  threshold_candidates,
+  balanced_accuracy_at,
+  numeric(1)
+)
+
+best_index <- which.max(threshold_scores)
+
+best_threshold <- threshold_candidates[best_index]
+best_accuracy <- threshold_scores[best_index]
+
+# Add selected threshold to table
+results_table <- bind_rows(threshold_table,
+                           data.frame(Threshold = best_threshold,
+                                                      Balanced_Accuracy = best_accuracy))|>
+  mutate(Threshold = round(Threshold, 4),
+         Balanced_Accuracy = round(Balanced_Accuracy, 4),
+         Selected = c(rep("", nrow(threshold_table)), "✓ Best"))
+
+# Display table
+kable(results_table,
+      caption = "Balanced Accuracy for Candidate Thresholds")
+
+```
+
+### Evaluation of Matching Performance
+
+The final model was evaluated on the independent test set from session 5. Matching performance was measured using:
+
+- Accuracy: proportion of correctly classified pairs.
+- True Positive Rate (Recall): proportion of same-writer pairs correctly identified.
+- False Positive Rate: proportion of different-writer pairs incorrectly classified as the same writer.
+- False Negative Rate: proportion of same-writer pairs incorrectly classified as different writers.
+- F1 Score: harmonic mean of precision and recall.
+- Area Under the ROC Curve (AUC): measures how well the model separates same-writer and different-writer pairs across all possible thresholds.
+
+```{r tab-evalmetrics}
+#| label: tbl-metrics
+#| tbl-cap: "Test Set Performance Metrics for the Siamese Network"
+
+d_test  <- as.numeric(predict(model, list(test$left,  test$right),
+                              verbose = 0))
+
+y_valid <- as.numeric(valid$y)
+y_test  <- as.numeric(test$y)
+
+# 7b. Test-set metrics threshold
+pred_same <- as.integer(d_test < best_threshold)
+conf <- table(Predicted = factor(pred_same, levels = 0:1, labels = c("different", "same")),
+              Actual    = factor(y_test,    levels = 0:1, labels = c("different", "same")))
+#print(conf)
+
+
+acc <- mean(pred_same == y_test) #accuracy
+tpr <- conf["same", "same"] / sum(conf[, "same"])                # true match rate (Sensitivity/recall)
+fpr <- conf["same", "different"] / sum(conf[, "different"])        # false match rate
+fnr <- 1 - tpr                                                     # false non-match rate
+precision <- conf["same", "same"] / sum(conf["same",])                # Precision
+f1 <- 2 * (precision * tpr) / (precision + tpr)
+
+# AUC 
+auc_from_dist <- function(d, y) {
+  s <- -d                                  # smaller distance = more "same"
+  r <- rank(s)
+  n1 <- sum(y == 1); n0 <- sum(y == 0)
+  (sum(r[y == 1]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+}
+auc <- auc_from_dist(d_test, y_test)
+#auc
+
+metrics_table <- data.frame(
+  Metric = c(
+    "Accuracy",
+    "Recall (TPR / Sensitivity)",
+    "Precision",
+    "F1-Score",
+    "False Positive Rate (FPR)",
+    "False Negative Rate (FNR)",
+    "AUC"
+  ),
+  Value = round(c(acc, tpr, precision, f1, fpr, fnr, auc),4))
+
+kable(metrics_table)
+      #caption = "Test Set Performance Metrics for the Siamese Network")
+```
+
+@tbl-metrics shows that the Siamese network achieved strong writer verification performance on the independent test set. Using the selected distance threshold, the model achieved an accuracy of 92.42%, indicating that most image pairs were classified correctly. The recall (92.98%) shows that the network successfully identified the majority of pairs written by the same writer, while the precision (92.07%) indicates that most pairs predicted as belonging to the same writer were correct. The F1-score of 92.52% demonstrates a good balance between precision and recall. Furthermore, the false positive rate (8.15%) and false negative rate (7.02%) were relatively low, suggesting that the model makes few matching errors.
+
+```{r fig-ROCcurve}
+#| label: fig-ROC
+#| fig-cap: "Siamese Network ROC"
+#| fig-width: 7
+#| fig-height: 4
+
+# 7c. ROC curve
+roc_pts <- t(sapply(sort(unique(c(0, d_test, Inf))), function(t) {
+  c(fpr = mean(d_test[y_test == 0] < t), tpr = mean(d_test[y_test == 1] < t))
+}))
+plot(roc_pts[, "fpr"], roc_pts[, "tpr"], type = "l", lwd = 2,
+     xlab = "False match rate", ylab = "True match rate",
+     main = sprintf("Siamese ROC, test session 5 (AUC = %.3f)", auc))
+abline(0, 1, lty = 2, col = "grey")
+
+
+```
+
+@fig-ROC The ROC curve produced an AUC of 0.976, indicating excellent discrimination between same-writer and different-writer pairs. Overall, the results suggest that the Siamese network learned a highly effective embedding space in which samples from the same writer are closer together than samples from different writers.
+
+## Section 4: Data Partition Strategy
+
+
+###  Candidate Strategy Critique
+
+
+The provided dataset is structured across multiple distinct dimensions (writers, digits, recording sessions, and replicates), which allows for several potential train, validation, and test partitioning strategies. These include a standard random split, a split by individual writer, a split by digit, and a split by session. For this assessment, the most optimal strategy is to partition the dataset strictly by session.
+
+
+### 1. The Random 80/20 Partition
+
+Utilising a random 80/20 split will result in a split that is not dependent on writer, digit or session. However each writer wrote the exact same digits, 0 - 4, 50 times in a single session thus some of these identical replicates will be in the training set and others in the test set leading to severe spatial-temporal data leakage. Moreover, the performance metrics become heavily over-optimistic as the model simply memorizes specific pixel configurations it has already seen, rather than learning generalizable human writing styles. 
+
+
+### 2. Split by Individual Writer
+
+In contrast, splitting by individual eliminates leakage as  certain writers will never appear in the training pool. For example writers 1- 16 in the training pool and writers 17 - 20 in the test pool. This split is optimal for the Siamese network as it gives a non-optimistic view of verification - to authenticate if two completely unknown hands belong to the same person. However this split breaks the CNN classifier  as the model cannot predict or classify the output for writer 17 with only having the output nodes for 1-16.
+
+### 3. Split by Digit
+
+ Similarly, splitting the data by digit will result in the CNN model breaking.  While training the model will learn a specific combination of strokes tied to specific character shapes however when presented with a new digit in test it will fail as the geometric structure of the number is foreign. However the Siamese network successfully handles a digit split as it bypasses discrete classification entirely and  will take on  the general style from the digits in training and apply that information to the test data. 
+
+
+### 4. Justification for the Session-Based Split
+
+Overall, splitting the train and test data by session is the optimal strategy. This approach provides an identical, perfectly balanced evaluation ground for both the Siamese network and CNN. he CNN retains access to all 20 output classes, while the Siamese network can fairly evaluate similarity metrics across all 5 available digits.  Furthermore, there is no optimistic bias or data leakage as session 5 is kept separate from the training loop. Lastly this strategy is optimal as it will be able to handle natural style drift over time (e.g., hand fatigue, mood changes, or stylus wear between sessions) by being trained on historical data (sessions 1 -3), validated on session 4, and tested on future data (Session 5) . This evaluation strategy represents a measure of the Temporal Style Generalisation within a Closed-Universe System.  Thus by splitting by session all writers and all digits are preserved across both models. 
+
+
+```{r fig-partition}
+#| fig-cap: "Chronological session partition blueprint"
+#| fig-width: 7
+#| fig-height: 3
+split_df <- data.frame(
+  Split = factor(c("Train (60%)", "Validation (20%)", "Test (20%)"),
+                 levels = rev(c("Train (60%)", "Validation (20%)", "Test (20%)"))),
+  Count = c(15000, 5000, 5000)
+)
+ggplot(split_df, aes(y = Split, x = Count, fill = Split)) +
+  geom_col(width = 0.5) +
+  scale_fill_manual(values = c("Train (60%)" = "blue",
+                               "Validation (20%)" = "lightblue",
+                               "Test (20%)" = "darkblue")) +
+  theme_minimal(base_size = 14) +
+  labs(x = "Total Image Count", y = NULL) +
+  theme(legend.position = "none", panel.grid.major.y = element_blank())
+```
+
+
