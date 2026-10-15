@@ -1,0 +1,9 @@
+6. Comparison of the CNN and Siamese Results
+
+The CNN and Siamese network approached writer identification differently. The CNN directly classified the writer from a single digit image, while the Siamese network learned a similarity measure that determined whether two images were written by the same person. The Siamese network achieved stronger overall performance, as indicated by its high balanced accuracy and AUC. By comparing image pairs rather than predicting writer identities directly, the Siamese network was better able to learn writer-specific handwriting characteristics.
+
+Digits do not contribute equally to writer identification. Digits with more complex shapes, such as 2, 4, 7 and 9, are likely to contain more writer-specific information because writers can differ in stroke direction, curvature, slant and digit construction. In contrast, simple digits such as 0 and 1 provide fewer opportunities for stylistic variation and therefore tend to be less informative for distinguishing between writers.
+
+Session changes can negatively affect performance because handwriting naturally varies over time. Although each writer maintains a consistent overall style, factors such as writing speed, pen pressure and natural variation between recording sessions can alter the appearance of the digits. This may cause samples from the same writer to appear less similar, making writer identification more challenging. However, by constructing positive pairs across sessions during Siamese network training, the model learns to focus on stable writer characteristics rather than session-specific features, improving generalisation to unseen data.
+
+Overall, the results suggest that the Siamese network is more robust to session variation and better suited to capturing writer-specific characteristics than the CNN.
