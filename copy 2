@@ -1,6 +1,6 @@
 ---
-title: "Handwriting Analysis: Exploratory Data Analysis & Experimental Setup"
-subtitle: "Questions 1 and 4 Complete Report"
+title: "Handwriting Analysis: Exploration, CNN and Experimental Setup"
+subtitle: "Questions 1, 2 and 4 — working report"
 format:
   html:
     toc: true
@@ -16,9 +16,10 @@ execute:
 ---
 
 ```{r setup}
+reticulate::py_require(python_version = "3.11")
 library(keras3)
+use_backend("tensorflow", gpu = FALSE)
 library(tidyverse)
-use_backend("tensorflow")
 
 data <- readRDS("handwriting.rds")
 x_scaled <- data$images / 255
@@ -133,7 +134,7 @@ df <- bind_rows(
 plot_panels(df)
 ```
 
-```{r fig-character-profile 2}
+```{r fig-character-profile-writer-10}
 #| fig-cap: "Digits 0 to 4 written by Writer 10 (consistent individual signature)"
 #| fig-width: 9
 #| fig-height: 2.5
@@ -187,6 +188,232 @@ plot_panels(df)
 ```
 
 
+
+## Section 2: CNN Writer Identification
+
+<!-- Q2 reuses the setup objects: x_train, x_val, x_test,
+     y_train_person, y_val_person, meta_test, and the session row indices.
+
+
+### Prediction Task and Model
+
+The aim was to identify which of the 20 writers produced a single handwritten digit image. Each input was a 28 × 28 greyscale image, and the response was the writer ID. The task was therefore a 20-class classification problem. Although the images contained digits 0–4, the model was trained to recognise the writer rather than the digit.
+
+Pixel values were divided by 255 to scale them to between 0 and 1. Sessions 1–3 were used for training, session 4 for validation and session 5 for testing. This gave 15,000 training images, 5,000 validation images and 5,000 test images. All writers and digits were represented in each subset. This design evaluates whether the model can identify known writers in a different recording session. The reasons for choosing a session-based split are discussed further in Section 4.
+
+The CNN contained two convolutional layers, with 32 and 64 filters respectively. Both used 3 × 3 kernels, same padding and ReLU activation, followed by 2 × 2 max pooling. These layers allow the model to learn local features, such as stroke shapes and curves, and combine them into features useful for distinguishing writers. The feature maps were flattened and passed through a dense layer with 128 ReLU units. An L2 penalty of 0.0001 was applied to the dense layer's weights, followed by dropout with a rate of 0.5. These measures were included to reduce overfitting, although they do not guarantee that it will be avoided.
+
+The final layer had 20 softmax units, producing a probability distribution over the writer IDs. The writer with the highest probability was selected as the prediction. The labels were converted from IDs 1–20 to indices 0–19 and one-hot encoded for training. The model used categorical cross-entropy with the Adam optimiser, a learning rate of 0.0001 and a batch size of 64. A random seed of 2026 was set before building the model.
+
+Training was allowed to run for up to 30 epochs. Early stopping monitored validation loss, with patience of three epochs, and restored the weights from the epoch with the lowest validation loss. The validation session was therefore used to select the training duration.
+
+```{r}
+#| label: q2-cnn-fit
+#| include: false
+
+# Construct a fresh model and seed its random operations.
+clear_session()
+set_random_seed(2026)
+
+# The shared setup stores writer labels as integers 0–19.
+cnn_y_train <- to_categorical(y_train_person, num_classes = 20)
+cnn_y_val <- to_categorical(y_val_person, num_classes = 20)
+
+cnn_input <- layer_input(shape = c(28, 28, 1))
+
+cnn_output <- cnn_input |>
+  layer_conv_2d(32, 3, padding = "same") |>
+  layer_activation("relu") |>
+  layer_max_pooling_2d(2) |>
+  layer_conv_2d(64, 3, padding = "same") |>
+  layer_activation("relu") |>
+  layer_max_pooling_2d(2) |>
+  layer_flatten() |>
+  layer_dense(
+    128,
+    activation = "relu",
+    kernel_regularizer = regularizer_l2(0.0001)
+  ) |>
+  layer_dropout(0.5) |>
+  layer_dense(20, activation = "softmax")
+
+cnn_model <- keras_model(inputs = cnn_input, outputs = cnn_output)
+
+compile(
+  cnn_model,
+  loss = "categorical_crossentropy",
+  optimizer = optimizer_adam(learning_rate = 0.0001),
+  metrics = "accuracy",
+  jit_compile = FALSE
+)
+
+cnn_early_stop <- callback_early_stopping(
+  monitor = "val_loss",
+  patience = 3,
+  restore_best_weights = TRUE
+)
+
+cnn_history <- fit(
+  cnn_model,
+  x_train, cnn_y_train,
+  epochs = 30,
+  batch_size = 64,
+  validation_data = list(x_val, cnn_y_val),
+  shuffle = TRUE,
+  verbose = 0,
+  callbacks = list(cnn_early_stop),
+  view_metrics = FALSE
+)
+
+cnn_probabilities <- predict(cnn_model, x_test, verbose = 0)
+cnn_predicted_writer <- max.col(cnn_probabilities, ties.method = "first")
+cnn_actual_writer <- meta_test$person_id
+cnn_correct <- cnn_predicted_writer == cnn_actual_writer
+cnn_accuracy <- mean(cnn_correct)
+cnn_best_epoch <- which.min(cnn_history$metrics$val_loss)
+cnn_epochs_run <- length(cnn_history$metrics$loss)
+
+cnn_results_by_digit <- do.call(
+  rbind,
+  lapply(0:4, function(d) {
+    rows <- meta_test$digit == d
+    data.frame(
+      digit = d,
+      n_images = sum(rows),
+      n_correct = sum(cnn_correct[rows]),
+      writer_accuracy_percent = round(100 * mean(cnn_correct[rows]), 1)
+    )
+  })
+)
+
+cnn_cm <- caret::confusionMatrix(
+  data = factor(cnn_predicted_writer, levels = 1:20),
+  reference = factor(cnn_actual_writer, levels = 1:20)
+)
+
+# Available for checking the writer-level discussion.
+cnn_writer_performance <- data.frame(
+  writer = 1:20,
+  recall_percent = 100 * diag(cnn_cm$table) / colSums(cnn_cm$table),
+  precision_percent = 100 * diag(cnn_cm$table) / rowSums(cnn_cm$table)
+)
+```
+
+### Training Behaviour
+
+```{r}
+#| label: fig-cnn-training
+#| fig-cap: "CNN training and validation accuracy and loss across the epochs run."
+#| fig-width: 7
+#| fig-height: 5
+
+plot(cnn_history)
+```
+
+The model ran for `r cnn_epochs_run` epochs, with the lowest validation loss of `r sprintf("%.4f", min(cnn_history$metrics$val_loss))` occurring at epoch `r cnn_best_epoch`. The weights from that epoch were restored for testing. The highest validation accuracy observed during training was `r sprintf("%.2f", 100 * max(cnn_history$metrics$val_accuracy))`%, at epoch `r which.max(cnn_history$metrics$val_accuracy)`. This was not necessarily the selected epoch because early stopping monitored validation loss rather than accuracy.
+
+@fig-cnn-training shows a widening gap between training and validation performance. Training accuracy increased from `r sprintf("%.2f", 100 * cnn_history$metrics$accuracy[1])`% in the first epoch to `r sprintf("%.2f", 100 * tail(cnn_history$metrics$accuracy, 1))`% in the final epoch. However, validation accuracy levelled off, while validation loss increased after its minimum. This pattern is consistent with overfitting: the model continued to improve on the training images, but the additional learning did not transfer well to the validation session. Session-specific features may contribute to this gap, although the curves alone cannot establish which features the model used.
+
+Validation accuracy can remain similar while validation loss rises because loss also reflects the probabilities assigned to each class. A model can make approximately the same number of mistakes while becoming more confident in its incorrect predictions. The monitored loss also includes the L2 penalty. Early stopping limited further training once validation loss stopped improving; it did not cause the overfitting. The last point in the training curve describes the last epoch run, rather than the restored model used for the test predictions.
+
+### Overall Test Performance
+
+```{r}
+#| label: tbl-cnn-overall
+#| tbl-cap: "CNN writer identification performance on the held-out test session."
+
+knitr::kable(
+  data.frame(
+    Measure = c(
+      "Test images", "Correct writer predictions", "Accuracy (%)",
+      "Uniform guessing baseline (%)", "Cohen's kappa"
+    ),
+    Value = c(
+      as.character(length(cnn_correct)),
+      as.character(sum(cnn_correct)),
+      sprintf("%.2f", 100 * cnn_accuracy),
+      "5.00",
+      sprintf("%.4f", unname(cnn_cm$overall["Kappa"]))
+    )
+  ),
+  row.names = FALSE,
+  align = c("l", "r")
+)
+```
+
+The selected model correctly identified the writer for `r format(sum(cnn_correct), big.mark = ",", scientific = FALSE, trim = TRUE)` of the `r format(length(cnn_correct), big.mark = ",", scientific = FALSE, trim = TRUE)` test images, giving an overall accuracy of **`r sprintf("%.2f", 100 * cnn_accuracy)`%** (@tbl-cnn-overall). In practical terms, this corresponds to correctly identifying the writer for approximately `r round(100 * cnn_accuracy)` out of every 100 test images. Accuracy is the proportion of images for which the predicted writer matches the actual writer.
+
+Each writer contributed the same number of test images, so the overall result was not dominated by a more common writer. Uniform random guessing among the 20 writers would have an expected accuracy of 5%. The model therefore learned useful information for identifying writers, although it still incorrectly attributed `r sprintf("%.1f", 100 * (1 - cnn_accuracy))`% of the test images.
+
+Cohen's kappa was `r sprintf("%.4f", unname(cnn_cm$overall["Kappa"]))`. This measures agreement between predicted and actual writer IDs after accounting for agreement expected by chance from their marginal distributions. A value of 1 indicates perfect agreement and 0 indicates agreement at the chance level. Kappa provides an additional description of performance, but does not show whether all writers are identified equally well.
+
+### Performance by Digit
+
+```{r}
+#| label: tbl-cnn-by-digit
+#| tbl-cap: "Writer identification accuracy by digit on the test set."
+
+knitr::kable(
+  cnn_results_by_digit,
+  col.names = c("Digit", "Test images", "Correct predictions", "Accuracy (%)"),
+  digits = c(0, 0, 0, 1),
+  row.names = FALSE
+)
+```
+
+```{r}
+#| label: fig-cnn-by-digit
+#| fig-cap: "CNN writer identification accuracy for each digit in the test session."
+#| fig-width: 6
+#| fig-height: 4
+
+barplot(
+  cnn_results_by_digit$writer_accuracy_percent,
+  names.arg = cnn_results_by_digit$digit,
+  ylim = c(0, 100),
+  col = "steelblue",
+  xlab = "Digit",
+  ylab = "Writer identification accuracy (%)"
+)
+```
+
+@tbl-cnn-by-digit and @fig-cnn-by-digit compare writer identification accuracy separately for each digit. Each digit contributed 1,000 test images, with 50 from each writer, making the digit groups comparable in size and writer composition. The same trained CNN was used for all digits; separate models were not fitted for this comparison.
+
+The highest accuracy was obtained for digit `r cnn_results_by_digit$digit[which.max(cnn_results_by_digit$writer_accuracy_percent)]`, at `r sprintf("%.1f", max(cnn_results_by_digit$writer_accuracy_percent))`%. This was followed by digit `r cnn_results_by_digit$digit[order(-cnn_results_by_digit$writer_accuracy_percent)[2]]`, at `r sprintf("%.1f", sort(cnn_results_by_digit$writer_accuracy_percent, decreasing = TRUE)[2])`%. The lowest accuracy was obtained for digit `r cnn_results_by_digit$digit[which.min(cnn_results_by_digit$writer_accuracy_percent)]`, at `r sprintf("%.1f", min(cnn_results_by_digit$writer_accuracy_percent))`%. The difference between the highest and lowest values was `r sprintf("%.1f", diff(range(cnn_results_by_digit$writer_accuracy_percent)))` percentage points.
+
+These results suggest that some digit shapes provided more useful writer-specific information to this CNN than others in the test session. Differences in stroke shape, slant or curvature could help distinguish writers, but this comparison does not establish which features caused the differences. Small differences between digits should also be interpreted cautiously, as no formal test of those differences was carried out.
+
+Accuracy by digit measures how reliably the writer can be identified when a particular digit is presented. It does not measure whether the model can recognise the digit itself. A lower writer identification accuracy for a digit therefore does not mean that the digit was unreadable; it means that the model found it harder to distinguish who wrote it.
+
+### Writer Confusions and Interpretation
+
+```{r}
+#| label: fig-cnn-confusion
+#| fig-cap: "Writer confusion matrix: actual writer IDs on the horizontal axis and predicted writer IDs on the vertical axis."
+#| fig-width: 7
+#| fig-height: 6
+
+cnn_confusion_df <- as.data.frame(cnn_cm$table)
+ggplot(cnn_confusion_df, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile(colour = "white", linewidth = 0.15) +
+  scale_y_discrete(limits = rev(levels(cnn_confusion_df$Prediction))) +
+  scale_fill_gradient(low = "white", high = "steelblue4", name = "Images") +
+  coord_fixed() +
+  labs(x = "Actual writer", y = "Predicted writer") +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid = element_blank())
+```
+
+In @fig-cnn-confusion, actual writer IDs appear on the horizontal axis and predicted IDs on the vertical axis. Diagonal cells represent correct predictions, while cells away from the diagonal show which writers were confused. The matrix shows that performance varied substantially between writers.
+
+Writer-level recall is the proportion of a particular writer's test images that were correctly identified. Writers 11 and 18 had recalls of `r sprintf("%.1f", cnn_writer_performance$recall_percent[11])`% and `r sprintf("%.1f", cnn_writer_performance$recall_percent[18])`%, respectively, whereas writer 5 had a recall of `r sprintf("%.1f", cnn_writer_performance$recall_percent[5])`%. Writer 10 had a recall of `r sprintf("%.1f", cnn_writer_performance$recall_percent[10])`%, with `r as.integer(cnn_cm$table["2", "10"])` of their 250 images attributed to writer 2. Similarly, `r as.integer(cnn_cm$table["13", "5"])` of writer 5's images were attributed to writer 13. These examples show that the errors were concentrated in particular writer confusions rather than being evenly distributed across all classes.
+
+Recall should be distinguished from precision. Recall asks how many of a writer's own images were correctly recognised. Precision asks how many images assigned to that writer actually belonged to them. For example, writer 11's precision was `r sprintf("%.1f", cnn_writer_performance$precision_percent[11])`%. Even when all of a writer's own images are recognised, some images from other writers may also be incorrectly assigned to that writer. This distinction matters if the model is used to attribute an image to a specific person.
+
+The CNN provides a baseline for recognising these 20 writers across recording sessions. Its overall performance indicates that it learned useful distinctions between writers, but the training curves and confusion matrix also show limitations. Similar writing styles or changes between sessions could explain some errors, although additional analysis would be needed to distinguish these explanations.
+
+The evaluation concerns new-session images from known writers. It does not measure the ability to identify a person who was absent from training, and the classifier will still choose one of the 20 IDs if presented with such a person. Testing on one held-out session also does not quantify how performance varies across other possible sessions. Finally, because the images were simulated, these results should not be taken as evidence of equivalent performance on real handwriting.
+
 ## Section 4: Data Partition Strategy
 
 
@@ -233,4 +460,3 @@ ggplot(split_df, aes(y = Split, x = Count, fill = Split)) +
   labs(x = "Total Image Count", y = NULL) +
   theme(legend.position = "none", panel.grid.major.y = element_blank())
 ```
-
