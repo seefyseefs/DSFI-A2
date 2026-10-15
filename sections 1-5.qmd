@@ -1,0 +1,1334 @@
+---
+title: "Handwriting Analysis: Exploratory Data Analysis & Experimental Setup"
+subtitle: "Questions 1 and 4 Complete Report"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    theme: cosmo
+    embed-resources: true
+    code-fold: false
+engine: knitr
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r setup1}
+library(keras3)
+library(tidyverse)
+library(dplyr)
+library(knitr)
+library(caret)
+library(pROC)
+library(reticulate)
+py_require(python_version = "3.12")
+use_backend("tensorflow")
+set.seed(20260923)
+
+data <- readRDS("handwriting.rds")
+x_scaled <- data$images / 255
+
+
+get_image_df <- function(index, label_text) {
+  img_matrix <- x_scaled[index, , , 1]
+  as.data.frame(as.table(img_matrix)) |>
+    rename(Y = Var1, X = Var2, Intensity = Freq) |>
+    mutate(
+      X = as.numeric(X),
+      Y = 29 - as.numeric(Y), # flip Y axis so digits render right-side up
+      PanelLabel = label_text
+    )
+}
+
+
+plot_panels <- function(df) {
+  ggplot(df, aes(x = X, y = Y, fill = Intensity)) +
+    geom_tile() +
+    facet_wrap(~ PanelLabel, nrow = 1) +
+    scale_fill_gradient(low = "white", high = "black") +
+    coord_fixed() +
+    theme_void(base_size = 14) +
+    theme(legend.position = "none",
+          strip.text = element_text(face = "bold"))
+}
+
+
+x_all <- data$images / 255
+y_all_person <- data$metadata$person_id - 1 # 0-indexed for Keras
+
+#create partitions
+train_rows <- which(data$metadata$session %in% c(1, 2, 3))
+val_rows   <- which(data$metadata$session == 4)
+test_rows  <- which(data$metadata$session == 5)
+
+# --- Partition Images (x) ---
+x_train <- x_all[train_rows, , , , drop = FALSE]
+x_val   <- x_all[val_rows, , , , drop = FALSE]
+x_test  <- x_all[test_rows, , , , drop = FALSE]
+
+# --- Partition Writer IDs for CNN (y) ---
+y_train_person <- y_all_person[train_rows]
+y_val_person   <- y_all_person[val_rows]
+y_test_person  <- y_all_person[test_rows]
+
+meta <- data$metadata
+
+person  <- meta$person_id               # the "class label" for the Siamese task
+session <- meta$session
+digit   <- meta$digit
+
+```
+
+## Section 1: Exploratory Data Analysis 
+
+### Global Dataset Profile overview
+The handwriting dataset evaluated in this study constitutes a completely uniform, synthetically balanced array designed for writer identification and verification tasks. It contains a total population of 25,000 unique images mapped across a multi-dimensional recording matrix. The underlying data distribution is structured as follows:
+
+- **Writers (20):** Represented by `person_id` ranging from 1 to 20.
+- **Characters (5):** Represented by `digit` spanning 0 to 4.
+- **Temporal Intervals (5):** Represented by `session` tracking blocks 1 to 5.
+- **Replicate Volume (50):** Represented by `replicate` indicating repeated frames from 1 to 50 captured sequentially within a single sitting.
+
+The data collection is entirely free from any structural class imbalances as it  contains exactly 50 replicates for every single intersecting combination of person, digit, and session ($20 \times 5 \times 5 \times 50 = 25,000$). This perfect alignment avoids standard sampling biases,thus overall  accuracy metrics will remain uninflated by majority-class dominance.
+
+
+The raw data image is formatted as integer elements ranging from 0 (representing the blank background canvas) to 255 (representing the maximum ink density path). The image pixel values were  scaled to [0,1] before fitting the models as it will cause numerical instability during early backpropagation rounds. (this paragraph could probably be moved to the end of q1)
+
+Moreover, each person has a consistent handwriting style, but their writing style fluctuates between the 5 recording  due to various factors - different writing materials or natural variation. 
+
+### Analysis of Visible Sources of Variation
+
+
+#### Inter-Writer Style Variation 
+
+In order to examine the inter-writer style variation the single character class (digit 0) across the first 5 writers is analysed in the figure below. It is evident that there is a clear variation in the writing style of each writer. For instance, writer 1's character leans towards the left with an asymmetrical top loop whereas writer 2 produces uniform stroke borders with flat horizontal loops. Furthermore, writer 3 produces a small, pinched dense circle unlike writers 4 and 5 with larger round circles where writer 4 is less symmetrical than writer 5. These differences act as key identity signals that convolutional filters can easily latch onto to identify writers. 
+
+
+```{r fig-inter-writer}
+#| fig-cap: "Digit 0 written by Writers 1 to 5 (inter-writer style variation)"
+#| fig-width: 9
+#| fig-height: 2.5
+rows <- which(data$metadata$digit == 0 & data$metadata$session == 1 &
+              data$metadata$replicate == 1 & data$metadata$person_id %in% 1:5)
+df <- bind_rows(
+  get_image_df(rows[1], "Writer 1"),
+  get_image_df(rows[2], "Writer 2"),
+  get_image_df(rows[3], "Writer 3"),
+  get_image_df(rows[4], "Writer 4"),
+  get_image_df(rows[5], "Writer 5")
+)
+plot_panels(df)
+```
+
+#### Consistent Individual Handwriting Signatures 
+When tracking multiple characters produced by a single hand, a cohesive, cross-character fingerprint becomes apparent. For example, evaluating Writer 1 the writer maintains a perfectly upright, non-slanted angle across all stroke length. Conversely, when evaluating writer 10 in session 5 it is evident that the writer sustains a slanted angle to the right across all digits. This verifies that personal writing styles carry over into different character geometries. 
+
+```{r fig-character-profile}
+#| fig-cap: "Digits 0 to 4 written by Writer 1 (consistent individual signature)"
+#| fig-width: 9
+#| fig-height: 2.5
+rows <- which(data$metadata$person_id == 1 & data$metadata$session == 1 &
+              data$metadata$replicate == 1)
+df <- bind_rows(
+  get_image_df(rows[1], "Digit 0"),
+  get_image_df(rows[2], "Digit 1"),
+  get_image_df(rows[3], "Digit 2"),
+  get_image_df(rows[4], "Digit 3"),
+  get_image_df(rows[5], "Digit 4")
+)
+plot_panels(df)
+```
+
+```{r fig-character-profile 2}
+#| fig-cap: "Digits 0 to 4 written by Writer 10 (consistent individual signature)"
+#| fig-width: 9
+#| fig-height: 2.5
+rows <- which(data$metadata$person_id == 10 & data$metadata$session == 5 &
+              data$metadata$replicate == 1)
+df <- bind_rows(
+  get_image_df(rows[1], "Digit 0"),
+  get_image_df(rows[2], "Digit 1"),
+  get_image_df(rows[3], "Digit 2"),
+  get_image_df(rows[4], "Digit 3"),
+  get_image_df(rows[5], "Digit 4")
+)
+plot_panels(df)
+```
+#### Temporal Session Drift 
+In examining the consistency of writer style across different sessions it is evident that there is subtle variability over time.It is evident for writer 1 that the style of the digit 2 written varies throughout all sessions 5. In Sessions 3 and 4, the upper curvature of Digit 2 becomes compressed and shortened compared to the expansive, loops drawn in Sessions 1,2 and 4. This successfully mimics operational variations, such as hand fatigue, changing writing speeds, or pen being used. 
+
+```{r fig-temporal-drift}
+#| fig-cap: "Digit 2 by Writer 1 across Sessions 1 to 5 (temporal drift)"
+#| fig-width: 9
+#| fig-height: 2.5
+rows <- which(data$metadata$person_id == 1 & data$metadata$digit == 2 &
+              data$metadata$replicate == 1)
+df <- bind_rows(
+  get_image_df(rows[1], "Session 1"),
+  get_image_df(rows[2], "Session 2"),
+  get_image_df(rows[3], "Session 3"),
+  get_image_df(rows[4], "Session 4"),
+  get_image_df(rows[5], "Session 5")
+)
+plot_panels(df)
+```
+
+### Limitations of the Simulated Data
+
+A critical flaw in the simulated  data is visible when examining consecutive replicates within the same session. Replicates 1 through 5 for Digit 3 appear almost completely identical down to individual pixel coordinates. However real human handwriting is inherently stochastic due to organic hand movements thus making it impossible for a human to trace an identical stroke 50 times sequentially. The absence of these variations shows that the simulation generates an artificial clean environment.
+```{r fig-replicate-jitter}
+#| fig-cap: "Digit 3 by Writer 1, Session 1, Replicates 1 to 5"
+#| fig-width: 9
+#| fig-height: 2.5
+rows <- which(data$metadata$person_id == 1 & data$metadata$digit == 3 &
+              data$metadata$session == 1 & data$metadata$replicate %in% 1:5)
+df <- bind_rows(
+  get_image_df(rows[1], "Replicate 1"),
+  get_image_df(rows[2], "Replicate 2"),
+  get_image_df(rows[3], "Replicate 3"),
+  get_image_df(rows[4], "Replicate 4"),
+  get_image_df(rows[5], "Replicate 5")
+)
+plot_panels(df)
+```
+
+
+## 
+
+## Section 2: CNN Writer Identification
+
+\<!-- Q2 reuses the setup objects: x_train, x_val, x_test, y_train_person, y_val_person, meta_test, and the session row indices.
+
+### Prediction Task and Model
+
+The aim was to identify which of the 20 writers produced a single handwritten digit image. Each input was a 28 × 28 greyscale image, and the response was the writer ID. The task was therefore a 20-class classification problem. Although the images contained digits 0–4, the model was trained to recognise the writer rather than the digit.
+
+Pixel values were divided by 255 to scale them to between 0 and 1. Sessions 1–3 were used for training, session 4 for validation and session 5 for testing. This gave 15,000 training images, 5,000 validation images and 5,000 test images. All writers and digits were represented in each subset. This design evaluates whether the model can identify known writers in a different recording session. The reasons for choosing a session-based split are discussed further in Section 4.
+
+The CNN contained two convolutional layers, with 32 and 64 filters respectively. Both used 3 × 3 kernels, same padding and ReLU activation, followed by 2 × 2 max pooling. These layers allow the model to learn local features, such as stroke shapes and curves, and combine them into features useful for distinguishing writers. The feature maps were flattened and passed through a dense layer with 128 ReLU units. An L2 penalty of 0.0001 was applied to the dense layer's weights, followed by dropout with a rate of 0.5. These measures were included to reduce overfitting, although they do not guarantee that it will be avoided.
+
+The final layer had 20 softmax units, producing a probability distribution over the writer IDs. The writer with the highest probability was selected as the prediction. The labels were converted from IDs 1–20 to indices 0–19 and one-hot encoded for training. The model used categorical cross-entropy with the Adam optimiser, a learning rate of 0.0001 and a batch size of 64. A random seed of 2026 was set before building the model.
+
+Training was allowed to run for up to 30 epochs. Early stopping monitored validation loss, with patience of three epochs, and restored the weights from the epoch with the lowest validation loss. The validation session was therefore used to select the training duration.
+
+```{r}
+#| label: q2-cnn-fit
+#| include: false
+
+# Construct a fresh model and seed its random operations.
+clear_session()
+set_random_seed(2026)
+
+# The shared setup stores writer labels as integers 0–19.
+cnn_y_train <- to_categorical(y_train_person, num_classes = 20)
+cnn_y_val <- to_categorical(y_val_person, num_classes = 20)
+
+cnn_input <- layer_input(shape = c(28, 28, 1))
+
+cnn_output <- cnn_input |>
+  layer_conv_2d(32, 3, padding = "same") |>
+  layer_activation("relu") |>
+  layer_max_pooling_2d(2) |>
+  layer_dropout(rate = 0.3) |> 
+  layer_conv_2d(64, 3, padding = "same") |>
+  layer_activation("relu") |>
+  layer_max_pooling_2d(2) |>
+  layer_dropout(rate = 0.3) |> 
+  layer_flatten() |>
+  layer_dense(
+    128,
+    activation = "relu",
+    kernel_regularizer = regularizer_l2(0.0001)
+  ) |>
+  layer_dropout(0.5) |>
+  layer_dense(20, activation = "softmax")
+
+cnn_model <- keras_model(inputs = cnn_input, outputs = cnn_output)
+
+compile(
+  cnn_model,
+  loss = "categorical_crossentropy",
+  optimizer = optimizer_adam(learning_rate = 0.0001),
+  metrics = "accuracy",
+  jit_compile = FALSE
+)
+
+cnn_early_stop <- callback_early_stopping(
+  monitor = "val_loss",
+  patience = 3,
+  restore_best_weights = TRUE
+)
+
+cnn_history <- fit(
+  cnn_model,
+  x_train, cnn_y_train,
+  epochs = 15,
+  batch_size = 64,
+  validation_data = list(x_val, cnn_y_val),
+  shuffle = TRUE,
+  verbose = 0,
+  callbacks = list(cnn_early_stop),
+  view_metrics = FALSE
+)
+
+cnn_probabilities <- predict(cnn_model, x_test, verbose = 0)
+cnn_predicted_writer <- max.col(cnn_probabilities, ties.method = "first")
+cnn_actual_writer <- meta_test$person_id
+cnn_correct <- cnn_predicted_writer == cnn_actual_writer
+cnn_accuracy <- mean(cnn_correct)
+cnn_best_epoch <- which.min(cnn_history$metrics$val_loss)
+cnn_epochs_run <- length(cnn_history$metrics$loss)
+
+cnn_results_by_digit <- do.call(
+  rbind,
+  lapply(0:4, function(d) {
+    rows <- meta_test$digit == d
+    data.frame(
+      digit = d,
+      n_images = sum(rows),
+      n_correct = sum(cnn_correct[rows]),
+      writer_accuracy_percent = round(100 * mean(cnn_correct[rows]), 1)
+    )
+  })
+)
+
+cnn_cm <- caret::confusionMatrix(
+  data = factor(cnn_predicted_writer, levels = 1:20),
+  reference = factor(cnn_actual_writer, levels = 1:20)
+)
+
+# Available for checking the writer-level discussion.
+cnn_writer_performance <- data.frame(
+  writer = 1:20,
+  recall_percent = 100 * diag(cnn_cm$table) / colSums(cnn_cm$table),
+  precision_percent = 100 * diag(cnn_cm$table) / rowSums(cnn_cm$table)
+)
+```
+
+### Training Behaviour
+
+```{r}
+#| label: fig-cnn-training
+#| fig-cap: "CNN training and validation accuracy and loss across the epochs run."
+#| fig-width: 7
+#| fig-height: 5
+
+plot(cnn_history)
+```
+
+The model ran for `r cnn_epochs_run` epochs, with the lowest validation loss of `r sprintf("%.4f", min(cnn_history$metrics$val_loss))` occurring at epoch `r cnn_best_epoch`. The weights from that epoch were restored for testing. The highest validation accuracy observed during training was `r sprintf("%.2f", 100 * max(cnn_history$metrics$val_accuracy))`%, at epoch `r which.max(cnn_history$metrics$val_accuracy)`. This was not necessarily the selected epoch because early stopping monitored validation loss rather than accuracy.
+
+@fig-cnn-training shows a widening gap between training and validation performance. Training accuracy increased from `r sprintf("%.2f", 100 * cnn_history$metrics$accuracy[1])`% in the first epoch to `r sprintf("%.2f", 100 * tail(cnn_history$metrics$accuracy, 1))`% in the final epoch. However, validation accuracy levelled off, while validation loss increased after its minimum. This pattern is consistent with overfitting: the model continued to improve on the training images, but the additional learning did not transfer well to the validation session. Session-specific features may contribute to this gap, although the curves alone cannot establish which features the model used.
+
+Validation accuracy can remain similar while validation loss rises because loss also reflects the probabilities assigned to each class. A model can make approximately the same number of mistakes while becoming more confident in its incorrect predictions. The monitored loss also includes the L2 penalty. Early stopping limited further training once validation loss stopped improving; it did not cause the overfitting. The last point in the training curve describes the last epoch run, rather than the restored model used for the test predictions.
+
+### Overall Test Performance
+
+```{r}
+#| label: tbl-cnn-overall
+#| tbl-cap: "CNN writer identification performance on the held-out test session."
+
+knitr::kable(
+  data.frame(
+    Measure = c(
+      "Test images", "Correct writer predictions", "Accuracy (%)",
+      "Uniform guessing baseline (%)", "Cohen's kappa"
+    ),
+    Value = c(
+      as.character(length(cnn_correct)),
+      as.character(sum(cnn_correct)),
+      sprintf("%.2f", 100 * cnn_accuracy),
+      "5.00",
+      sprintf("%.4f", unname(cnn_cm$overall["Kappa"]))
+    )
+  ),
+  row.names = FALSE,
+  align = c("l", "r")
+)
+```
+
+The selected model correctly identified the writer for `r format(sum(cnn_correct), big.mark = ",", scientific = FALSE, trim = TRUE)` of the `r format(length(cnn_correct), big.mark = ",", scientific = FALSE, trim = TRUE)` test images, giving an overall accuracy of **`r sprintf("%.2f", 100 * cnn_accuracy)`%** (@tbl-cnn-overall). In practical terms, this corresponds to correctly identifying the writer for approximately `r round(100 * cnn_accuracy)` out of every 100 test images. Accuracy is the proportion of images for which the predicted writer matches the actual writer.
+
+Each writer contributed the same number of test images, so the overall result was not dominated by a more common writer. Uniform random guessing among the 20 writers would have an expected accuracy of 5%. The model therefore learned useful information for identifying writers, although it still incorrectly attributed `r sprintf("%.1f", 100 * (1 - cnn_accuracy))`% of the test images.
+
+Cohen's kappa was `r sprintf("%.4f", unname(cnn_cm$overall["Kappa"]))`. This measures agreement between predicted and actual writer IDs after accounting for agreement expected by chance from their marginal distributions. A value of 1 indicates perfect agreement and 0 indicates agreement at the chance level. Kappa provides an additional description of performance, but does not show whether all writers are identified equally well.
+
+### Performance by Digit
+
+```{r}
+#| label: tbl-cnn-by-digit
+#| tbl-cap: "Writer identification accuracy by digit on the test set."
+
+knitr::kable(
+  cnn_results_by_digit,
+  col.names = c("Digit", "Test images", "Correct predictions", "Accuracy (%)"),
+  digits = c(0, 0, 0, 1),
+  row.names = FALSE
+)
+```
+
+```{r}
+#| label: fig-cnn-by-digit
+#| fig-cap: "CNN writer identification accuracy for each digit in the test session."
+#| fig-width: 6
+#| fig-height: 4
+
+barplot(
+  cnn_results_by_digit$writer_accuracy_percent,
+  names.arg = cnn_results_by_digit$digit,
+  ylim = c(0, 100),
+  col = "steelblue",
+  xlab = "Digit",
+  ylab = "Writer identification accuracy (%)"
+)
+```
+
+@tbl-cnn-by-digit and @fig-cnn-by-digit compare writer identification accuracy separately for each digit. Each digit contributed 1,000 test images, with 50 from each writer, making the digit groups comparable in size and writer composition. The same trained CNN was used for all digits; separate models were not fitted for this comparison.
+
+The highest accuracy was obtained for digit `r cnn_results_by_digit$digit[which.max(cnn_results_by_digit$writer_accuracy_percent)]`, at `r sprintf("%.1f", max(cnn_results_by_digit$writer_accuracy_percent))`%. This was followed by digit `r cnn_results_by_digit$digit[order(-cnn_results_by_digit$writer_accuracy_percent)[2]]`, at `r sprintf("%.1f", sort(cnn_results_by_digit$writer_accuracy_percent, decreasing = TRUE)[2])`%. The lowest accuracy was obtained for digit `r cnn_results_by_digit$digit[which.min(cnn_results_by_digit$writer_accuracy_percent)]`, at `r sprintf("%.1f", min(cnn_results_by_digit$writer_accuracy_percent))`%. The difference between the highest and lowest values was `r sprintf("%.1f", diff(range(cnn_results_by_digit$writer_accuracy_percent)))` percentage points.
+
+These results suggest that some digit shapes provided more useful writer-specific information to this CNN than others in the test session. Differences in stroke shape, slant or curvature could help distinguish writers, but this comparison does not establish which features caused the differences. Small differences between digits should also be interpreted cautiously, as no formal test of those differences was carried out.
+
+Accuracy by digit measures how reliably the writer can be identified when a particular digit is presented. It does not measure whether the model can recognise the digit itself. A lower writer identification accuracy for a digit therefore does not mean that the digit was unreadable; it means that the model found it harder to distinguish who wrote it.
+
+### Writer Confusions and Interpretation
+
+```{r}
+#| label: fig-cnn-confusion
+#| fig-cap: "Writer confusion matrix: actual writer IDs on the horizontal axis and predicted writer IDs on the vertical axis."
+#| fig-width: 7
+#| fig-height: 6
+
+cnn_confusion_df <- as.data.frame(cnn_cm$table)
+ggplot(cnn_confusion_df, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile(colour = "white", linewidth = 0.15) +
+  scale_y_discrete(limits = rev(levels(cnn_confusion_df$Prediction))) +
+  scale_fill_gradient(low = "white", high = "steelblue4", name = "Images") +
+  coord_fixed() +
+  labs(x = "Actual writer", y = "Predicted writer") +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid = element_blank())
+```
+
+In @fig-cnn-confusion, actual writer IDs appear on the horizontal axis and predicted IDs on the vertical axis. Diagonal cells represent correct predictions, while cells away from the diagonal show which writers were confused. The matrix shows that performance varied substantially between writers.
+
+Writer-level recall is the proportion of a particular writer's test images that were correctly identified. Writers 11 and 18 had recalls of `r sprintf("%.1f", cnn_writer_performance$recall_percent[11])`% and `r sprintf("%.1f", cnn_writer_performance$recall_percent[18])`%, respectively, whereas writer 5 had a recall of `r sprintf("%.1f", cnn_writer_performance$recall_percent[5])`%. Writer 10 had a recall of `r sprintf("%.1f", cnn_writer_performance$recall_percent[10])`%, with `r as.integer(cnn_cm$table["2", "10"])` of their 250 images attributed to writer 2. Similarly, `r as.integer(cnn_cm$table["13", "5"])` of writer 5's images were attributed to writer 13. These examples show that the errors were concentrated in particular writer confusions rather than being evenly distributed across all classes.
+
+Recall should be distinguished from precision. Recall asks how many of a writer's own images were correctly recognised. Precision asks how many images assigned to that writer actually belonged to them. For example, writer 11's precision was `r sprintf("%.1f", cnn_writer_performance$precision_percent[11])`%. Even when all of a writer's own images are recognised, some images from other writers may also be incorrectly assigned to that writer. This distinction matters if the model is used to attribute an image to a specific person.
+
+The CNN provides a baseline for recognising these 20 writers across recording sessions. Its overall performance indicates that it learned useful distinctions between writers, but the training curves and confusion matrix also show limitations. Similar writing styles or changes between sessions could explain some errors, although additional analysis would be needed to distinguish these explanations.
+
+The evaluation concerns new-session images from known writers. It does not measure the ability to identify a person who was absent from training, and the classifier will still choose one of the 20 IDs if presented with such a person. Testing on one held-out session also does not quantify how performance varies across other possible sessions. Finally, because the images were simulated, these results should not be taken as evidence of equivalent performance on real handwriting.
+
+```{r setup}
+library(keras3)
+library(tidyverse)
+library(dplyr)
+library(knitr)
+library(caret)
+library(pROC)
+library(reticulate)
+py_require(python_version = "3.12")
+use_backend("tensorflow")
+set.seed(20260923)
+
+data <- readRDS("handwriting.rds")
+x_scaled <- data$images / 255
+
+
+get_image_df <- function(index, label_text) {
+  img_matrix <- x_scaled[index, , , 1]
+  as.data.frame(as.table(img_matrix)) |>
+    rename(Y = Var1, X = Var2, Intensity = Freq) |>
+    mutate(
+      X = as.numeric(X),
+      Y = 29 - as.numeric(Y), # flip Y axis so digits render right-side up
+      PanelLabel = label_text
+    )
+}
+
+
+plot_panels <- function(df) {
+  ggplot(df, aes(x = X, y = Y, fill = Intensity)) +
+    geom_tile() +
+    facet_wrap(~ PanelLabel, nrow = 1) +
+    scale_fill_gradient(low = "white", high = "black") +
+    coord_fixed() +
+    theme_void(base_size = 14) +
+    theme(legend.position = "none",
+          strip.text = element_text(face = "bold"))
+}
+
+
+x_all <- data$images / 255
+y_all_person <- data$metadata$person_id - 1 # 0-indexed for Keras
+
+#create partitions
+train_rows <- which(data$metadata$session %in% c(1, 2, 3))
+val_rows   <- which(data$metadata$session == 4)
+test_rows  <- which(data$metadata$session == 5)
+
+# --- Partition Images (x) ---
+x_train <- x_all[train_rows, , , , drop = FALSE]
+x_val   <- x_all[val_rows, , , , drop = FALSE]
+x_test  <- x_all[test_rows, , , , drop = FALSE]
+
+# --- Partition Writer IDs for CNN (y) ---
+y_train_person <- y_all_person[train_rows]
+y_val_person   <- y_all_person[val_rows]
+y_test_person  <- y_all_person[test_rows]
+
+meta <- data$metadata
+
+person  <- meta$person_id               # the "class label" for the Siamese task
+session <- meta$session
+digit   <- meta$digit
+
+```
+
+
+
+
+
+
+
+
+
+## Section 3: Writer Verification using a Siamese Network
+
+### Data Preparation
+
+The handwriting images were loaded and scaled by dividing the pixel values by 255. This converted all pixel values to the range 0 to 1, which helps the neural network train more effectively. The data was split by session to avoid data leakage. Sessions 1 to 3 were used for training, session 4 for validation, and session 5 for testing.
+
+### Construction of Training Examples
+
+Training examples were created as pairs of images. For each pair, there was a 50% chance that both images came from the same writer and a 50% chance that they came from different writers.
+
+A label of 1 was assigned if the two images were written by the same person, and a label of 0 was assigned if they were written by different people. This balanced set of positive and negative pairs allowed the model to learn writer similarity.
+
+```{r tab-pairs}
+#| label: tbl-make_pairs
+#| tbl-cap: "Test Set Performance Metrics for the Siamese Network"
+make_pairs <- function(ids, n, class_labels = person) {
+  a <- sample(ids, n, replace = TRUE)
+  b <- vapply(a, function(i) {
+    same <- runif(1) < .5
+    pool <- ids[class_labels[ids] == class_labels[i]]
+    if (!same) pool <- ids[class_labels[ids] != class_labels[i]]
+    pool <- setdiff(pool, i)
+    pool[sample.int(length(pool), 1)]   
+  }, integer(1))
+  cbind(a, b)
+}
+
+# Slide 27:
+make_batch <- function(p, images = x_scaled, class_labels = person) {
+  y <- matrix(as.integer(class_labels[p[, 1]] == class_labels[p[, 2]]), ncol = 1)
+  list(
+    left  = images[p[, 1], , , , drop = FALSE],
+    right = images[p[, 2], , , , drop = FALSE],
+    y     = y
+  )
+}
+
+pairs_train <- make_pairs(train_rows, 20000)
+pairs_valid <- make_pairs(val_rows, 5000)
+pairs_test  <- make_pairs(test_rows,  5000)
+
+train <- make_batch(pairs_train)
+valid <- make_batch(pairs_valid)
+test  <- make_batch(pairs_test)
+
+#mean(train$y); mean(valid$y); mean(test$y)   # should all be about 0.5
+
+pair_summary <- data.frame(
+  Dataset = c("Training", "Validation", "Test"),
+  Number_of_Pairs = c(
+    nrow(pairs_train),
+    nrow(pairs_valid),
+    nrow(pairs_test)
+  ),
+  Positive_Pair_Proportion = round(
+    c(
+      mean(train$y),
+      mean(valid$y),
+      mean(test$y)
+    ),
+    4
+  )
+)
+
+kable(pair_summary)
+  #caption = "Summary of Siamese Network Pair Construction")
+
+```
+
+
+### Shared Encoder Network
+
+A convolutional neural network (CNN) was used as the shared encoder. The encoder consisted of three convolutional layers with ReLU activation functions and max-pooling layers for feature extraction.
+
+The encoder transformed each handwriting image into a compact feature representation that captured important writer characteristics.
+
+```{r}
+image <- layer_input(shape = c(28, 28, 1))
+z <- image |>
+  layer_conv_2d(32, 3, activation = "relu", padding = "same") |>
+  layer_max_pooling_2d(2) |>
+  layer_conv_2d(64, 3, activation = "relu", padding = "same") |>
+  layer_max_pooling_2d(2) |>
+  layer_conv_2d(64, 3, activation = "relu", padding = "same") |>
+  layer_global_average_pooling_2d() |>
+  layer_dense(32)
+encoder <- keras_model(image, z)
+
+```
+
+### Siamese Network Architecture
+
+The Siamese network contained two identical branches that shared the same encoder weights. Each branch processed one image from a pair.
+
+The feature vectors produced by the encoder were compared using Euclidean distance. Small distances indicated that the images were likely written by the same person, while larger distances suggested different writers.
+
+```{r}
+a <- layer_input(shape = c(28, 28, 1))
+b <- layer_input(shape = c(28, 28, 1))
+distance <- list(encoder(a), encoder(b)) |>
+  layer_lambda(f = function(z) {
+    op_sqrt(op_sum(op_square(z[[1]] - z[[2]]), axis = 2,
+                   keepdims = TRUE) + 1e-7)
+  })
+model <- keras_model(list(a, b), distance)
+
+```
+
+### Contrastive Loss Function
+
+The model was trained using contrastive loss with a margin of 1.
+
+For pairs from the same writer, the loss function encouraged the distance between embeddings to become smaller. For pairs from different writers, the loss function encouraged the distance to be greater than the margin. This helped the network learn a feature space where handwriting from the same writer was grouped together and handwriting from different writers was separated.
+
+```{r}
+contrastive_loss <- function(y, d) {
+  op_mean(y * op_square(d) +
+            (1 - y) * op_square(op_maximum(1 - d, 0)))
+}
+```
+
+### Model Training
+
+The model was trained using the Adam optimiser with a learning rate of 0.001. Training was performed for up to 20 epochs with a batch size of 64.
+
+Early stopping was applied using the validation loss from session 4. Training stopped automatically if the validation loss did not improve for three consecutive epochs, helping to reduce overfitting.
+
+```{r fig-training}
+#| fig-cap: "Training and validation loss of the Siamese network over training epochs."
+#| fig-width: 7
+#| fig-height: 4
+
+model |> compile(optimizer = optimizer_adam(1e-3),
+                 loss = contrastive_loss)
+
+history <- model |> 
+  fit(list(train$left, train$right), 
+      train$y,
+      validation_data = list(list(valid$left, valid$right), valid$y),
+      epochs = 10, 
+      batch_size = 64,
+      callbacks = list(callback_early_stopping(monitor = "val_loss", 
+                                               patience = 3,
+                                               restore_best_weights = TRUE)),
+      verbose = 0)
+p <- plot(history)
+
+p +
+  ggplot2::labs(
+    title = "Training and Validation Loss of the Siamese Network")
+
+```
+
+The training loss decreased steadily from approximately 0.15 to 0.04, showing that the model learned the training data effectively. The validation loss decreased initially but then remained relatively constant, suggesting that the model generalised well with only slight signs of overfitting after the first few epochs.
+
+### Threshold Selection
+
+The Siamese network outputs a distance rather than a direct same-or-different prediction. A decision threshold was therefore selected using the validation set.
+
+Distances below the threshold were classified as the same writer, while distances above the threshold were classified as different writers. The threshold that achieved the highest balanced accuracy on the validation set was chosen.
+
+```{r tab-threshold}
+#| tbl-cap: "Threshold Selection Based on Validation Set Balanced Accuracy"
+
+d_valid <- as.numeric(predict(model, list(valid$left, valid$right),
+                              verbose = 0))
+
+valid_same <- valid_same <- as.logical(valid$y[, 1])
+
+balanced_accuracy_at <- function(cut) {
+  predicts_same <- d_valid < cut
+  same_rate <- mean(predicts_same[valid_same])
+  different_rate <- mean(!predicts_same[!valid_same])
+  (same_rate + different_rate) / 2
+}
+# Candidate thresholds
+example_thresholds <- unique(
+  as.numeric(quantile(d_valid, c(0.25, 0.50, 0.75)))
+)
+
+threshold_table <- data.frame(Threshold = example_thresholds,
+                              Balanced_Accuracy = vapply(example_thresholds,
+                                                         balanced_accuracy_at,
+                                                         numeric(1)))
+
+# Optimal threshold
+threshold_candidates <- sort(unique(d_valid))
+threshold_scores <- vapply(
+  threshold_candidates,
+  balanced_accuracy_at,
+  numeric(1)
+)
+
+best_index <- which.max(threshold_scores)
+
+best_threshold <- threshold_candidates[best_index]
+best_accuracy <- threshold_scores[best_index]
+
+# Add selected threshold to table
+results_table <- bind_rows(threshold_table,
+                           data.frame(Threshold = best_threshold,
+                                                      Balanced_Accuracy = best_accuracy))|>
+  mutate(Threshold = round(Threshold, 4),
+         Balanced_Accuracy = round(Balanced_Accuracy, 4),
+         Selected = c(rep("", nrow(threshold_table)), "✓ Best"))
+
+# Display table
+kable(results_table,
+      caption = "Balanced Accuracy for Candidate Thresholds")
+
+```
+
+### Evaluation of Matching Performance
+
+The final model was evaluated on the independent test set from session 5. Matching performance was measured using:
+
+- Accuracy: proportion of correctly classified pairs.
+- True Positive Rate (Recall): proportion of same-writer pairs correctly identified.
+- False Positive Rate: proportion of different-writer pairs incorrectly classified as the same writer.
+- False Negative Rate: proportion of same-writer pairs incorrectly classified as different writers.
+- F1 Score: harmonic mean of precision and recall.
+- Area Under the ROC Curve (AUC): measures how well the model separates same-writer and different-writer pairs across all possible thresholds.
+
+```{r tab-evalmetrics}
+#| label: tbl-metrics
+#| tbl-cap: "Test Set Performance Metrics for the Siamese Network"
+
+d_test  <- as.numeric(predict(model, list(test$left,  test$right),
+                              verbose = 0))
+
+y_valid <- as.numeric(valid$y)
+y_test  <- as.numeric(test$y)
+
+# 7b. Test-set metrics threshold
+pred_same <- as.integer(d_test < best_threshold)
+conf <- table(Predicted = factor(pred_same, levels = 0:1, labels = c("different", "same")),
+              Actual    = factor(y_test,    levels = 0:1, labels = c("different", "same")))
+#print(conf)
+
+
+acc <- mean(pred_same == y_test) #accuracy
+tpr <- conf["same", "same"] / sum(conf[, "same"])                # true match rate (Sensitivity/recall)
+fpr <- conf["same", "different"] / sum(conf[, "different"])        # false match rate
+fnr <- 1 - tpr                                                     # false non-match rate
+precision <- conf["same", "same"] / sum(conf["same",])                # Precision
+f1 <- 2 * (precision * tpr) / (precision + tpr)
+
+# AUC 
+auc_from_dist <- function(d, y) {
+  s <- -d                                  # smaller distance = more "same"
+  r <- rank(s)
+  n1 <- sum(y == 1); n0 <- sum(y == 0)
+  (sum(r[y == 1]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+}
+auc <- auc_from_dist(d_test, y_test)
+#auc
+
+metrics_table <- data.frame(
+  Metric = c(
+    "Accuracy",
+    "Recall (TPR / Sensitivity)",
+    "Precision",
+    "F1-Score",
+    "False Positive Rate (FPR)",
+    "False Negative Rate (FNR)",
+    "AUC"
+  ),
+  Value = round(c(acc, tpr, precision, f1, fpr, fnr, auc),4))
+
+kable(metrics_table)
+      #caption = "Test Set Performance Metrics for the Siamese Network")
+```
+
+@tbl-metrics shows that the Siamese network achieved strong writer verification performance on the independent test set. Using the selected distance threshold, the model achieved an accuracy of 92.42%, indicating that most image pairs were classified correctly. The recall (92.98%) shows that the network successfully identified the majority of pairs written by the same writer, while the precision (92.07%) indicates that most pairs predicted as belonging to the same writer were correct. The F1-score of 92.52% demonstrates a good balance between precision and recall. Furthermore, the false positive rate (8.15%) and false negative rate (7.02%) were relatively low, suggesting that the model makes few matching errors.
+
+```{r fig-ROCcurve}
+#| label: fig-ROC
+#| fig-cap: "Siamese Network ROC"
+#| fig-width: 7
+#| fig-height: 4
+
+# 7c. ROC curve
+roc_pts <- t(sapply(sort(unique(c(0, d_test, Inf))), function(t) {
+  c(fpr = mean(d_test[y_test == 0] < t), tpr = mean(d_test[y_test == 1] < t))
+}))
+plot(roc_pts[, "fpr"], roc_pts[, "tpr"], type = "l", lwd = 2,
+     xlab = "False match rate", ylab = "True match rate",
+     main = sprintf("Siamese ROC, test session 5 (AUC = %.3f)", auc))
+abline(0, 1, lty = 2, col = "grey")
+
+
+```
+
+@fig-ROC The ROC curve produced an AUC of 0.976, indicating excellent discrimination between same-writer and different-writer pairs. Overall, the results suggest that the Siamese network learned a highly effective embedding space in which samples from the same writer are closer together than samples from different writers.
+
+## Section 4: Data Partition Strategy
+
+
+###  Candidate Strategy Critique
+
+
+The provided dataset is structured across multiple distinct dimensions (writers, digits, recording sessions, and replicates), which allows for several potential train, validation, and test partitioning strategies. These include a standard random split, a split by individual writer, a split by digit, and a split by session. For this assessment, the most optimal strategy is to partition the dataset strictly by session.
+
+
+### 1. The Random 80/20 Partition
+
+Utilising a random 80/20 split will result in a split that is not dependent on writer, digit or session. However each writer wrote the exact same digits, 0 - 4, 50 times in a single session thus some of these identical replicates will be in the training set and others in the test set leading to severe spatial-temporal data leakage. Moreover, the performance metrics become heavily over-optimistic as the model simply memorizes specific pixel configurations it has already seen, rather than learning generalizable human writing styles. 
+
+
+### 2. Split by Individual Writer
+
+In contrast, splitting by individual eliminates leakage as  certain writers will never appear in the training pool. For example writers 1- 16 in the training pool and writers 17 - 20 in the test pool. This split is optimal for the Siamese network as it gives a non-optimistic view of verification - to authenticate if two completely unknown hands belong to the same person. However this split breaks the CNN classifier  as the model cannot predict or classify the output for writer 17 with only having the output nodes for 1-16.
+
+### 3. Split by Digit
+
+ Similarly, splitting the data by digit will result in the CNN model breaking.  While training the model will learn a specific combination of strokes tied to specific character shapes however when presented with a new digit in test it will fail as the geometric structure of the number is foreign. However the Siamese network successfully handles a digit split as it bypasses discrete classification entirely and  will take on  the general style from the digits in training and apply that information to the test data. 
+
+
+### 4. Justification for the Session-Based Split
+
+Overall, splitting the train and test data by session is the optimal strategy. This approach provides an identical, perfectly balanced evaluation ground for both the Siamese network and CNN. he CNN retains access to all 20 output classes, while the Siamese network can fairly evaluate similarity metrics across all 5 available digits.  Furthermore, there is no optimistic bias or data leakage as session 5 is kept separate from the training loop. Lastly this strategy is optimal as it will be able to handle natural style drift over time (e.g., hand fatigue, mood changes, or stylus wear between sessions) by being trained on historical data (sessions 1 -3), validated on session 4, and tested on future data (Session 5) . This evaluation strategy represents a measure of the Temporal Style Generalisation within a Closed-Universe System.  Thus by splitting by session all writers and all digits are preserved across both models. 
+
+
+```{r fig-partition}
+#| fig-cap: "Chronological session partition blueprint"
+#| fig-width: 7
+#| fig-height: 3
+split_df <- data.frame(
+  Split = factor(c("Train (60%)", "Validation (20%)", "Test (20%)"),
+                 levels = rev(c("Train (60%)", "Validation (20%)", "Test (20%)"))),
+  Count = c(15000, 5000, 5000)
+)
+ggplot(split_df, aes(y = Split, x = Count, fill = Split)) +
+  geom_col(width = 0.5) +
+  scale_fill_manual(values = c("Train (60%)" = "blue",
+                               "Validation (20%)" = "lightblue",
+                               "Test (20%)" = "darkblue")) +
+  theme_minimal(base_size = 14) +
+  labs(x = "Total Image Count", y = NULL) +
+  theme(legend.position = "none", panel.grid.major.y = element_blank())
+```
+
+
+## Section 5: CNN Hyperparameter Tuning
+
+
+### Search Design
+
+A limited grid search was used to investigate whether changing the dense-layer size and learning rate improved the CNN's validation performance. These parameters were chosen because they affect different aspects of the model: dense-layer size changes the capacity of the final feature-combination stage, while learning rate controls the size of the Adam updates. The training curves in Section 2 showed overfitting, so smaller dense layers were included to test whether reducing capacity would improve performance on the validation session.
+
+The search considered 32, 64 and 128 dense units, together with learning rates of 0.0001, 0.0005 and 0.001, giving nine combinations. The original configuration of 128 dense units and a learning rate of 0.0001 was included as the baseline. The convolutional layers, dropout rate of 0.5, L2 penalty of 0.0001 and batch size of 64 were held fixed. Each model was trained for up to 15 epochs, with early stopping monitoring validation loss using patience of three epochs and restoration of the best weights. A fresh model and optimiser were created for each run, and the random seed was reset to 2026.
+
+The session split was unchanged: sessions 1–3 were used for training, session 4 for validation and session 5 for the final test comparison. The accuracy of each restored model was measured on session 4. This is important because the epoch with the lowest validation loss need not have the highest validation accuracy. The largest accuracy observed anywhere in a training history would not necessarily describe the weights retained by early stopping.
+
+The selection rule was the highest restored-model validation accuracy, using lower validation loss to break ties. Candidate rankings were based on validation results, rather than on the test scores.
+
+```{r}
+#| label: q5-recorded-results
+#| include: false
+
+# Recorded outputs from the nine runs supplied in the R console results.
+# These are actual recorded results, not estimated or simulated scores.
+# This block lets the report display those results without retraining.
+q5_settings <- data.frame(
+  dense_units = c(128L, 128L, 128L, 32L, 32L, 32L, 64L, 64L, 64L),
+  lr = c(0.0001, 0.0005, 0.001, 0.001, 0.0005, 0.0001,
+         0.0001, 0.001, 0.0005),
+  val_accuracy_percent = c(60.16, 55.34, 54.90, 52.74, 52.18,
+                           50.26, 50.12, 50.04, 46.26),
+  val_loss = c(1.299241, 1.413528, 1.660567, 1.624378, 1.621602,
+               1.590188, 1.514222, 1.583104, 1.551859),
+  selected_epoch = c(3L, 1L, 1L, 1L, 2L, 5L, 3L, 1L, 1L)
+)
+q5_comparison <- data.frame(
+  model = c("Q2 baseline", "Q5 selected configuration"),
+  test_accuracy_percent = c(63.3, 63.3)
+)
+```
+
+```{r}
+#| label: q5-repeat-search
+#| eval: false
+#| include: false
+
+# OPTIONAL REPRODUCTION: change eval to true to repeat the nine fits.
+# This reuses Q2's x_train, x_val, x_test, cnn_y_train and cnn_y_val.
+# It replaces the recorded result objects above with freshly computed results.
+
+q5_train_one <- function(dense_units, lr) {
+  clear_session()
+  set_random_seed(2026)
+  inp <- layer_input(shape = c(28, 28, 1))
+  out <- inp |>
+    layer_conv_2d(32, 3, padding = "same") |>
+    layer_activation("relu") |>
+    layer_max_pooling_2d(2) |>
+    layer_conv_2d(64, 3, padding = "same") |>
+    layer_activation("relu") |>
+    layer_max_pooling_2d(2) |>
+    layer_flatten() |>
+    layer_dense(dense_units, activation = "relu",
+                kernel_regularizer = regularizer_l2(0.0001)) |>
+    layer_dropout(0.5) |>
+    layer_dense(20, activation = "softmax")
+  candidate_model <- keras_model(inputs = inp, outputs = out)
+  compile(candidate_model, loss = "categorical_crossentropy",
+          optimizer = optimizer_adam(learning_rate = lr),
+          metrics = "accuracy", jit_compile = FALSE)
+  candidate_history <- fit(
+    candidate_model, x_train, cnn_y_train,
+    validation_data = list(x_val, cnn_y_val),
+    epochs = 15, batch_size = 64, shuffle = TRUE,
+    callbacks = list(callback_early_stopping(
+      monitor = "val_loss", patience = 3, restore_best_weights = TRUE
+    )),
+    verbose = 0, view_metrics = FALSE
+  )
+  scores <- evaluate(candidate_model, x_val, cnn_y_val,
+                     batch_size = 64, verbose = 0)
+  list(model = candidate_model,
+       accuracy = as.numeric(scores[["accuracy"]]),
+       loss = as.numeric(scores[["loss"]]),
+       selected_epoch = which.min(candidate_history$metrics$val_loss))
+}
+
+q5_settings <- expand.grid(dense_units = c(32, 64, 128),
+                           lr = c(0.0001, 0.0005, 0.001))
+q5_settings$val_accuracy_percent <- NA_real_
+q5_settings$val_loss <- NA_real_
+q5_settings$selected_epoch <- NA_integer_
+q5_best_accuracy <- -Inf
+q5_best_loss <- Inf
+q5_best_model <- NULL
+
+for (i in seq_len(nrow(q5_settings))) {
+  candidate <- q5_train_one(q5_settings$dense_units[i], q5_settings$lr[i])
+  q5_settings$val_accuracy_percent[i] <- 100 * candidate$accuracy
+  q5_settings$val_loss[i] <- candidate$loss
+  q5_settings$selected_epoch[i] <- candidate$selected_epoch
+  if (candidate$accuracy > q5_best_accuracy ||
+      (candidate$accuracy == q5_best_accuracy && candidate$loss < q5_best_loss)) {
+    q5_best_accuracy <- candidate$accuracy
+    q5_best_loss <- candidate$loss
+    q5_best_model <- candidate$model
+  }
+}
+
+# Test only the validation-selected candidate, after the search is complete.
+q5_test_predictions <- max.col(
+  predict(q5_best_model, x_test, verbose = 0), ties.method = "first"
+)
+q5_comparison <- data.frame(
+  model = c("Q2 baseline", "Q5 selected configuration"),
+  test_accuracy_percent = 100 * c(
+    cnn_accuracy, mean(q5_test_predictions == meta_test$person_id)
+  )
+)
+```
+
+```{r}
+#| label: q5-results-helpers
+#| include: false
+
+q5_settings <- q5_settings[
+  order(-q5_settings$val_accuracy_percent, q5_settings$val_loss),
+]
+rownames(q5_settings) <- NULL
+q5_best <- q5_settings[1, , drop = FALSE]
+q5_score <- function(units, rate) {
+  q5_settings$val_accuracy_percent[
+    q5_settings$dense_units == units & q5_settings$lr == rate
+  ]
+}
+q5_original_selected <- (
+  q5_best$dense_units == 128 && q5_best$lr == 0.0001
+)
+q5_test_difference <- diff(q5_comparison$test_accuracy_percent)
+```
+
+### Validation Results
+
+```{r}
+#| label: tbl-cnn-tuning
+#| tbl-cap: "Validation performance of the nine CNN hyperparameter configurations."
+
+q5_table <- q5_settings
+q5_table$lr <- sprintf("%.4f", q5_table$lr)
+knitr::kable(
+  q5_table,
+  col.names = c("Dense units", "Learning rate", "Validation accuracy (%)",
+                "Validation loss", "Selected epoch"),
+  digits = c(0, 4, 2, 4, 0),
+  row.names = FALSE
+)
+```
+
+@tbl-cnn-tuning shows that the highest validation accuracy was **`r sprintf("%.2f", q5_best$val_accuracy_percent)`%**, obtained with **`r q5_best$dense_units` dense units and a learning rate of `r format(q5_best$lr, scientific = FALSE)`**. Its selected checkpoint was epoch `r q5_best$selected_epoch`, with validation loss of `r sprintf("%.4f", q5_best$val_loss)`. `r if (q5_original_selected) "The search therefore selected the original Q2 configuration." else "The search selected a different configuration from the Q2 baseline."` The difference between the highest and lowest validation accuracies across the grid was `r sprintf("%.2f", diff(range(q5_settings$val_accuracy_percent)))` percentage points, showing that the choice of settings affected performance within the tested range.
+
+### Sensitivity to Dense-Layer Size and Learning Rate
+
+```{r}
+#| label: fig-cnn-tuning-sensitivity
+#| fig-cap: "Validation accuracy across learning rates for each dense-layer size. All runs used seed 2026."
+#| fig-width: 7
+#| fig-height: 4.5
+
+q5_plot <- q5_settings
+q5_plot$learning_rate <- factor(
+  q5_plot$lr, levels = c(0.0001, 0.0005, 0.001),
+  labels = c("0.0001", "0.0005", "0.001")
+)
+ggplot(q5_plot, aes(
+  x = learning_rate, y = val_accuracy_percent,
+  colour = factor(dense_units), group = factor(dense_units)
+)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2.5) +
+  labs(x = "Learning rate", y = "Validation accuracy (%)",
+       colour = "Dense units") +
+  theme_minimal(base_size = 12)
+```
+
+Dense-layer size had a noticeable effect on validation performance (@fig-cnn-tuning-sensitivity). The 128-unit model performed better than the 32- and 64-unit models at each of the three learning rates. At a learning rate of 0.0001, validation accuracy was `r sprintf("%.2f", q5_score(32, 0.0001))`% with 32 units, `r sprintf("%.2f", q5_score(64, 0.0001))`% with 64 units and `r sprintf("%.2f", q5_score(128, 0.0001))`% with 128 units. Reducing the dense-layer size therefore did not improve validation performance in these runs. Although the initial CNN showed overfitting, this does not imply that every reduction in model capacity will improve its ability to generalise.
+
+The effect of learning rate depended on the dense-layer size. For the 128-unit model, increasing the learning rate from 0.0001 to 0.0005 reduced validation accuracy from `r sprintf("%.2f", q5_score(128, 0.0001))`% to `r sprintf("%.2f", q5_score(128, 0.0005))`%. Increasing it further to 0.001 gave `r sprintf("%.2f", q5_score(128, 0.001))`%. In contrast, the 32-unit model improved from `r sprintf("%.2f", q5_score(32, 0.0001))`% at the lowest learning rate to `r sprintf("%.2f", q5_score(32, 0.001))`% at the highest. The 64-unit model had its lowest accuracy at the intermediate learning rate. The differing trends indicate that the learning-rate effect should be considered together with model capacity, rather than assuming that one learning rate is uniformly better for all architectures.
+
+Most configurations with the two higher learning rates selected an early checkpoint. This describes when their lowest monitored validation loss occurred; it does not, by itself, establish the reason for their lower accuracy. The comparisons concern the complete training procedure, including the 15-epoch limit and early-stopping rule, rather than the performance each architecture might achieve under an unlimited training budget.
+
+### Test Comparison with the Q2 Baseline
+
+```{r}
+#| label: tbl-cnn-tuning-test
+#| tbl-cap: "Test accuracy of the baseline and validation-selected CNN configuration."
+
+knitr::kable(
+  q5_comparison,
+  col.names = c("Model", "Test accuracy (%)"),
+  digits = c(0, 2), row.names = FALSE
+)
+```
+
+The Q2 baseline achieved `r sprintf("%.2f", q5_comparison$test_accuracy_percent[1])`% test accuracy, and the validation-selected configuration achieved `r sprintf("%.2f", q5_comparison$test_accuracy_percent[2])`% (@tbl-cnn-tuning-test). `r if (q5_original_selected && abs(q5_test_difference) < 1e-8) "This unchanged result is expected because the search selected the same architecture and learning rate as the baseline, using the same seed and training procedure. These should not be interpreted as two independent confirmations of performance." else paste0("The difference was ", sprintf("%.2f", q5_test_difference), " percentage points. The test comparison assesses the configuration selected using validation data; it was not the criterion used to rank candidates.")`
+
+The purpose of tuning was to compare plausible settings and assess sensitivity, rather than to guarantee an improvement. In this search, the alternative configurations did not outperform the original configuration on validation accuracy. Retaining the baseline was therefore supported by the observed validation results.
+
+### Limitations
+
+This was a small, single-seed search over a specified grid. Resetting the seed made the procedure more repeatable, but it did not measure how the rankings might change with different initial weights or training randomness. There were also no repeated validation-session splits, so the results do not quantify sensitivity to the choice of held-out session. The selected configuration should therefore be described as the best among those tested under this procedure, rather than as a globally optimal CNN.
+
+Test performance had already been inspected during the earlier analysis. Any further model choices should continue to be based on validation results, and the final test score should not be presented as a completely untouched estimate after all exploratory decisions. No results from the proposed six-configuration follow-up search are included here.
+```{r}
+RETRAIN <- TRUE
+results_file <- "siamese_tuning_results.rds"
+
+f3 <- function(v) sprintf("%.3f", v)   
+```
+
+## Hyperparameter optimisation: Siamese network
+
+### Approach
+
+We tuned the Siamese network from Task 3 using the same split as before: sessions 1–3 for training, session 4 for validation and session 5 for testing. Every setting was chosen using validation results only. Session 5 was used once, at the end, to report the chosen model's performance.
+
+We varied two hyperparameters:
+
+- **Embedding size** (16, 32, 64): how many numbers each image is compressed into. A larger embedding can hold more detail about writing style, but has more to learn and can overfit.
+- **Learning rate** (0.0001, 0.001, 0.01): how large a step the Adam optimiser takes on each update.
+
+We trained one model for every combination (3 × 3 = 9 models). Every model used the same random seed, the same training, validation and test pairs, and early stopping on validation loss (patience 3, up to 20 epochs). Differences between models therefore come from the hyperparameters.
+
+Models were compared using **AUC**: the probability that a randomly chosen same-writer pair gets a smaller distance than a randomly chosen different-writer pair.
+
+```{r}
+#| label: data-and-pairs
+hw   <- readRDS("handwriting.rds")
+x    <- hw$images / 255
+meta <- hw$metadata
+
+person  <- meta$person_id
+session <- meta$session
+digit   <- meta$digit
+
+train_ids <- which(session %in% 1:3)
+valid_ids <- which(session == 4)
+test_ids  <- which(session == 5)
+
+# Build pairs (slide 26): half same-writer, half different-writer
+make_pairs <- function(ids, n, class_labels = person) {
+  a <- sample(ids, n, replace = TRUE)
+  b <- vapply(a, function(i) {
+    same <- runif(1) < .5
+    pool <- ids[class_labels[ids] == class_labels[i]]
+    if (!same) pool <- ids[class_labels[ids] != class_labels[i]]
+    pool <- setdiff(pool, i)
+    pool[sample.int(length(pool), 1)]
+  }, integer(1))
+  cbind(a, b)
+}
+
+# Slide 27: turn index pairs into image arrays + labels (1 = same writer)
+make_batch <- function(p, images = x, class_labels = person) {
+  y <- matrix(as.integer(class_labels[p[, 1]] == class_labels[p[, 2]]), ncol = 1)
+  list(left  = images[p[, 1], , , , drop = FALSE],
+       right = images[p[, 2], , , , drop = FALSE],
+       y     = y)
+}
+
+set.seed(25)                       # same pairs every time the document is rendered
+pairs_train <- make_pairs(train_ids, 20000)
+pairs_valid <- make_pairs(valid_ids, 5000)
+pairs_test  <- make_pairs(test_ids,  5000)
+
+train <- make_batch(pairs_train)
+valid <- make_batch(pairs_valid)
+test  <- make_batch(pairs_test)
+```
+
+```{r}
+#| label: functions
+# Contrastive loss (slide 30), margin = 1
+contrastive_loss <- function(y, d) {
+  op_mean(y * op_square(d) +
+            (1 - y) * op_square(op_maximum(1 - d, 0)))
+}
+
+# Build and train ONE Siamese model.
+# Two things can change: emb_dim and lr.
+train_one_model <- function(emb_dim, lr) {
+
+  clear_session()          # wipe the previous model from memory
+  set_random_seed(25)      # same starting weights for every model
+
+  # Encoder
+  image <- layer_input(shape = c(28, 28, 1))
+  z <- image |>
+    layer_conv_2d(32, 3, activation = "relu", padding = "same") |>
+    layer_max_pooling_2d(2) |>
+    layer_conv_2d(64, 3, activation = "relu", padding = "same") |>
+    layer_max_pooling_2d(2) |>
+    layer_conv_2d(64, 3, activation = "relu", padding = "same") |>
+    layer_global_average_pooling_2d() |>
+    layer_dense(emb_dim)                                   # hyperparameter 1
+  encoder <- keras_model(image, z)
+
+  # Siamese model (slide 29)
+  a <- layer_input(shape = c(28, 28, 1))
+  b <- layer_input(shape = c(28, 28, 1))
+  distance <- list(encoder(a), encoder(b)) |>
+    layer_lambda(f = function(z) {
+      op_sqrt(op_sum(op_square(z[[1]] - z[[2]]), axis = 2,
+                     keepdims = TRUE) + 1e-7)
+    })
+  model <- keras_model(list(a, b), distance)
+
+  # Train (slide 31) with early stopping on the validation pairs
+  model |> compile(optimizer = optimizer_adam(lr),         # hyperparameter 2
+                   loss = contrastive_loss)
+
+  history <- model |> fit(
+    list(train$left, train$right), train$y,
+    validation_data = list(list(valid$left, valid$right), valid$y),
+    epochs = 20,
+    batch_size = 64,
+    callbacks = list(callback_early_stopping(monitor = "val_loss", patience = 3,
+                                             restore_best_weights = TRUE)),
+    verbose = 0
+  )
+
+  list(model = model, history = history)
+}
+
+# Distances for a set of pairs
+get_distances <- function(model, pairs) {
+  as.numeric(predict(model, list(pairs$left, pairs$right), verbose = 0))
+}
+
+# AUC for a set of pairs (minus the distance, because SMALL distance = "same")
+get_auc <- function(model, pairs) {
+  d <- get_distances(model, pairs)
+  if (any(!is.finite(d))) return(NA)    
+  as.numeric(auc(roc(as.numeric(pairs$y), -d, direction = "<", quiet = TRUE)))
+}
+
+
+summarise_run <- function(fit_obj) {
+  c(epochs    = length(fit_obj$history$metrics$loss),
+    train_auc = get_auc(fit_obj$model, train),
+    valid_auc = get_auc(fit_obj$model, valid),
+    test_auc  = get_auc(fit_obj$model, test))
+}
+```
+
+```{r}
+#| label: training
+if (RETRAIN || !file.exists(results_file)) {
+
+  # ---- 1. Grid: embedding size x learning rate ----
+  settings <- expand.grid(emb_dim = c(16, 32, 64),
+                          lr      = c(0.0001, 0.001, 0.01))
+  results <- NULL
+  for (i in 1:nrow(settings)) {
+    cat("Grid model", i, "of", nrow(settings), "\n")
+    fit_obj <- train_one_model(settings$emb_dim[i], settings$lr[i])
+    results <- rbind(results, summarise_run(fit_obj))
+  }
+  settings <- cbind(settings, results)
+  settings$gap <- settings$train_auc - settings$valid_auc     # overfitting gap
+  best <- settings[which.max(settings$valid_auc), ]
+
+  # ---- 2. Final model: retrain the best combination ----
+  final_fit  <- train_one_model(best$emb_dim, best$lr)
+  history_df <- as.data.frame(final_fit$history)
+  d_valid    <- get_distances(final_fit$model, valid)
+  d_test     <- get_distances(final_fit$model, test)
+
+  saveRDS(list(settings = settings, best = best, history_df = history_df,
+               d_valid = d_valid, d_test = d_test),
+          results_file)
+} else {
+  # Reload saved results instead of retraining
+  saved <- readRDS(results_file)
+  list2env(saved, envir = environment())
+}
+```
+
+```{r}
+#| label: final-evaluation
+y_valid <- as.numeric(valid$y)
+y_test  <- as.numeric(test$y)
+
+# Cut-off chosen on VALIDATION: 
+# accepting same-writer pairs and rejecting different-writer pairs.
+roc_valid <- roc(y_valid, -d_valid, direction = "<", quiet = TRUE)
+thr <- -as.numeric(coords(roc_valid, "best", ret = "threshold")$threshold[1])
+
+roc_test  <- roc(y_test, -d_test, direction = "<", quiet = TRUE)
+pred_same <- as.integer(d_test < thr)
+
+final_auc <- as.numeric(auc(roc_test))
+final_acc <- mean(pred_same == y_test)
+final_tpr <- mean(pred_same[y_test == 1] == 1)   # same writer correctly accepted
+final_fpr <- mean(pred_same[y_test == 0] == 1)   # different writer wrongly accepted
+
+# AUC within subsets of the test pairs
+auc_subset <- function(keep) {
+  as.numeric(auc(roc(y_test[keep], -d_test[keep], direction = "<", quiet = TRUE)))
+}
+same_digit <- digit[pairs_test[, 1]] == digit[pairs_test[, 2]]
+pair_type <- data.frame(
+  pair_type = c("Same digit", "Different digit"),
+  n_pairs   = c(sum(same_digit), sum(!same_digit)),
+  test_AUC  = c(auc_subset(same_digit), auc_subset(!same_digit))
+)
+by_digit <- data.frame(
+  digit    = 0:4,
+  test_AUC = sapply(0:4, function(d) auc_subset(digit[pairs_test[, 1]] == d))
+)
+
+# Sensitivity: how far does validation AUC move when each hyperparameter changes?
+range_emb <- tapply(settings$valid_auc, settings$lr,
+                    function(v) diff(range(v, na.rm = TRUE)))
+range_lr  <- tapply(settings$valid_auc, settings$emb_dim,
+                    function(v) diff(range(v, na.rm = TRUE)))
+sens <- c("embedding size" = max(range_emb, na.rm = TRUE),
+          "learning rate"  = max(range_lr,  na.rm = TRUE))
+most_sens  <- names(which.max(sens))
+least_sens <- names(which.min(sens))
+n_failed   <- sum(is.na(settings$valid_auc))
+```
+
+### Results
+
+@tbl-grid shows every combination of embedding size and learning rate, sorted by validation AUC. Validation AUC ranges only from 0.963 to 0.977, and test AUC from 0.973 to 0.978. Every combination learned to separate same-writer from different-writer pairs very well, which is why the bars in Figure 1 look almost identical. The best combination was an embedding size of **`r best$emb_dim`** with a learning rate of **`r best$lr`**, giving a validation AUC of **`r f3(best$valid_auc)`**. Validation AUC ranges only from 0.963 to 0.977, and test AUC from 0.973 to 0.978. Every combination learned to separate same-writer from different-writer pairs very well.Validation and test AUC also track each other closely: every model’s test AUC was within 0.010 of its validation AUC, and slightly higher in every case. Session 4 was therefore a reliable stand-in for an unseen session, and choosing settings on it did not mislead us about session 5.
+
+```{r}
+#| label: tbl-grid
+#| tbl-cap: "Grid search results, sorted by validation AUC. Gap = training AUC minus validation AUC."
+kable(settings[order(-settings$valid_auc), ], digits = 3, row.names = FALSE,
+      col.names = c("Embedding size", "Learning rate", "Epochs", "Train AUC",
+                    "Validation AUC", "Test AUC", "Gap"))
+```
+
+```{r}
+#| label: tbl-grid-wide
+#| tbl-cap: "Validation AUC by embedding size (rows) and learning rate (columns)."
+wide <- tapply(settings$valid_auc,
+               list(settings$emb_dim, settings$lr), mean)   
+kable(round(wide, 3))
+```
+
+### Sensitivity
+
+
+```{r}
+#| label: fig-sensitivity
+#| fig-cap: "Sensitivity of validation AUC to learning rate and embedding size."
+ggplot(settings, aes(x = factor(lr), y = valid_auc,
+                     colour = factor(emb_dim), group = factor(emb_dim))) +
+  geom_line() + geom_point(size = 3) +
+  labs(x = "Learning rate", y = "Validation AUC (session 4)", colour = "Embedding size")
+```
+
+
+@fig-sensitivity shows a clear pattern for embedding size. An embedding of 64 numbers was the weakest at every learning rate, and its disadvantage grew as the learning rate increased: validation AUC fell from 0.971 to 0.968 to 0.963. One plausible explanation is that, with more dimensions, the Euclidean distance adds up more squared differences, so small errors in individual dimensions accumulate.  Embedding sizes of 16 and 32 performed almost identically. This suggests that 16 numbers are already enough to describe the style differences between 20 writers, and extra dimensions add capacity the task does not need.
+
+The learning rate had a smaller and less consistent effect. For embedding sizes 16 and 32, validation AUC dipped slightly at 0.001 and rose at 0.01, but these movements are within about 0.006. 
+
+@fig-gap shows the overfitting gap: how much better each model does on the training pairs than on the validation pairs. A larger gap means the model has started memorising the training sessions rather than learning style that carries over to a new session.
+
+### Final model
+
+The final model reached a test AUC of 0.978. Moreover, it  classified 93.4% of test pairs correctly. It accepted 93.9% of genuine same-writer pairs and wrongly accepted 7.0% of different-writer pairs.
+
+```{r}
+#| label: tbl-final
+#| tbl-cap: "Final Siamese model: test performance (session 5)."
+kable(data.frame(
+  Measure = c("AUC",
+              "Accuracy (cut-off chosen on validation)",
+              "True match rate (same writer correctly accepted)",
+              "False match rate (different writer wrongly accepted)",
+              "Distance cut-off"),
+  Value = c(final_auc, final_acc, final_tpr, final_fpr, thr)
+), digits = 3)
+```
+
+```{r}
+#| label: tbl-confusion
+#| tbl-cap: "Final model: confusion table for the test pairs."
+kable(table(Predicted = ifelse(pred_same == 1, "Same", "Different"),
+            Actual    = ifelse(y_test == 1, "Same", "Different")))
+```
+
+The table above shows that of  the 2,488 same-writer test pairs, 2,335 were correctly accepted and 153 were wrongly rejected. Of the 2,512 different-writer pairs, 2,336 were correctly rejected and 176 were wrongly accepted. Overall the model made 329 errors in 5,000 decisions, split roughly evenly between the two types.
+
+
