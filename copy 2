@@ -256,7 +256,7 @@ cnn_early_stop <- callback_early_stopping(
 cnn_history <- fit(
   cnn_model,
   x_train, cnn_y_train,
-  epochs = 30,
+  epochs = 15,
   batch_size = 64,
   validation_data = list(x_val, cnn_y_val),
   shuffle = TRUE,
