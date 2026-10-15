@@ -189,13 +189,7 @@ plot_panels(df)
 
 
 
-## Section 2: CNN Writer Identification
-
-<!-- Q2 reuses the setup objects: x_train, x_val, x_test,
-     y_train_person, y_val_person, meta_test, and the session row indices.
-     Q2 commentary was drafted with ChatGPT and must be accounted for
-     accurately in the final per-task AI-use statement. Verify the analysis
-     and comply with the assignment rules on authorship of report prose. -->
+## Section 2: CNN
 
 ### Prediction Task and Model
 
