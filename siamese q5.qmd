@@ -1,0 +1,303 @@
+---
+title: "DS4I Assignment 2: Siamese Network Hyperparameter Optimisation"
+format: html
+execute:
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+#| include: false
+library(reticulate)
+py_require(python_version = "3.12")
+library(keras3)
+use_backend("tensorflow")
+library(pROC)
+library(ggplot2)
+library(knitr)
+
+
+RETRAIN <- TRUE
+results_file <- "siamese_tuning_results.rds"
+
+f3 <- function(v) sprintf("%.3f", v)   
+```
+
+## Hyperparameter optimisation: Siamese network
+
+### Approach
+
+We tuned the Siamese network from Task 3 using the same split as before: sessions 1–3 for training, session 4 for validation and session 5 for testing. Every setting was chosen using validation results only. Session 5 was used once, at the end, to report the chosen model's performance.
+
+We varied two hyperparameters:
+
+- **Embedding size** (16, 32, 64): how many numbers each image is compressed into. A larger embedding can hold more detail about writing style, but has more to learn and can overfit.
+- **Learning rate** (0.0001, 0.001, 0.01): how large a step the Adam optimiser takes on each update.
+
+We trained one model for every combination (3 × 3 = 9 models). Every model used the same random seed, the same training, validation and test pairs, and early stopping on validation loss (patience 3, up to 20 epochs). Differences between models therefore come from the hyperparameters.
+
+Models were compared using **AUC**: the probability that a randomly chosen same-writer pair gets a smaller distance than a randomly chosen different-writer pair.
+
+```{r}
+#| label: data-and-pairs
+hw   <- readRDS("handwriting.rds")
+x    <- hw$images / 255
+meta <- hw$metadata
+
+person  <- meta$person_id
+session <- meta$session
+digit   <- meta$digit
+
+train_ids <- which(session %in% 1:3)
+valid_ids <- which(session == 4)
+test_ids  <- which(session == 5)
+
+# Build pairs (slide 26): half same-writer, half different-writer
+make_pairs <- function(ids, n, class_labels = person) {
+  a <- sample(ids, n, replace = TRUE)
+  b <- vapply(a, function(i) {
+    same <- runif(1) < .5
+    pool <- ids[class_labels[ids] == class_labels[i]]
+    if (!same) pool <- ids[class_labels[ids] != class_labels[i]]
+    pool <- setdiff(pool, i)
+    pool[sample.int(length(pool), 1)]
+  }, integer(1))
+  cbind(a, b)
+}
+
+# Slide 27: turn index pairs into image arrays + labels (1 = same writer)
+make_batch <- function(p, images = x, class_labels = person) {
+  y <- matrix(as.integer(class_labels[p[, 1]] == class_labels[p[, 2]]), ncol = 1)
+  list(left  = images[p[, 1], , , , drop = FALSE],
+       right = images[p[, 2], , , , drop = FALSE],
+       y     = y)
+}
+
+set.seed(25)                       # same pairs every time the document is rendered
+pairs_train <- make_pairs(train_ids, 20000)
+pairs_valid <- make_pairs(valid_ids, 5000)
+pairs_test  <- make_pairs(test_ids,  5000)
+
+train <- make_batch(pairs_train)
+valid <- make_batch(pairs_valid)
+test  <- make_batch(pairs_test)
+```
+
+```{r}
+#| label: functions
+# Contrastive loss (slide 30), margin = 1
+contrastive_loss <- function(y, d) {
+  op_mean(y * op_square(d) +
+            (1 - y) * op_square(op_maximum(1 - d, 0)))
+}
+
+# Build and train ONE Siamese model.
+# Two things can change: emb_dim and lr.
+train_one_model <- function(emb_dim, lr) {
+
+  clear_session()          # wipe the previous model from memory
+  set_random_seed(25)      # same starting weights for every model
+
+  # Encoder
+  image <- layer_input(shape = c(28, 28, 1))
+  z <- image |>
+    layer_conv_2d(32, 3, activation = "relu", padding = "same") |>
+    layer_max_pooling_2d(2) |>
+    layer_conv_2d(64, 3, activation = "relu", padding = "same") |>
+    layer_max_pooling_2d(2) |>
+    layer_conv_2d(64, 3, activation = "relu", padding = "same") |>
+    layer_global_average_pooling_2d() |>
+    layer_dense(emb_dim)                                   # hyperparameter 1
+  encoder <- keras_model(image, z)
+
+  # Siamese model (slide 29)
+  a <- layer_input(shape = c(28, 28, 1))
+  b <- layer_input(shape = c(28, 28, 1))
+  distance <- list(encoder(a), encoder(b)) |>
+    layer_lambda(f = function(z) {
+      op_sqrt(op_sum(op_square(z[[1]] - z[[2]]), axis = 2,
+                     keepdims = TRUE) + 1e-7)
+    })
+  model <- keras_model(list(a, b), distance)
+
+  # Train (slide 31) with early stopping on the validation pairs
+  model |> compile(optimizer = optimizer_adam(lr),         # hyperparameter 2
+                   loss = contrastive_loss)
+
+  history <- model |> fit(
+    list(train$left, train$right), train$y,
+    validation_data = list(list(valid$left, valid$right), valid$y),
+    epochs = 20,
+    batch_size = 64,
+    callbacks = list(callback_early_stopping(monitor = "val_loss", patience = 3,
+                                             restore_best_weights = TRUE)),
+    verbose = 0
+  )
+
+  list(model = model, history = history)
+}
+
+# Distances for a set of pairs
+get_distances <- function(model, pairs) {
+  as.numeric(predict(model, list(pairs$left, pairs$right), verbose = 0))
+}
+
+# AUC for a set of pairs (minus the distance, because SMALL distance = "same")
+get_auc <- function(model, pairs) {
+  d <- get_distances(model, pairs)
+  if (any(!is.finite(d))) return(NA)    
+  as.numeric(auc(roc(as.numeric(pairs$y), -d, direction = "<", quiet = TRUE)))
+}
+
+
+summarise_run <- function(fit_obj) {
+  c(epochs    = length(fit_obj$history$metrics$loss),
+    train_auc = get_auc(fit_obj$model, train),
+    valid_auc = get_auc(fit_obj$model, valid),
+    test_auc  = get_auc(fit_obj$model, test))
+}
+```
+
+```{r}
+#| label: training
+if (RETRAIN || !file.exists(results_file)) {
+
+  # ---- 1. Grid: embedding size x learning rate ----
+  settings <- expand.grid(emb_dim = c(16, 32, 64),
+                          lr      = c(0.0001, 0.001, 0.01))
+  results <- NULL
+  for (i in 1:nrow(settings)) {
+    cat("Grid model", i, "of", nrow(settings), "\n")
+    fit_obj <- train_one_model(settings$emb_dim[i], settings$lr[i])
+    results <- rbind(results, summarise_run(fit_obj))
+  }
+  settings <- cbind(settings, results)
+  settings$gap <- settings$train_auc - settings$valid_auc     # overfitting gap
+  best <- settings[which.max(settings$valid_auc), ]
+
+  # ---- 2. Final model: retrain the best combination ----
+  final_fit  <- train_one_model(best$emb_dim, best$lr)
+  history_df <- as.data.frame(final_fit$history)
+  d_valid    <- get_distances(final_fit$model, valid)
+  d_test     <- get_distances(final_fit$model, test)
+
+  saveRDS(list(settings = settings, best = best, history_df = history_df,
+               d_valid = d_valid, d_test = d_test),
+          results_file)
+} else {
+  # Reload saved results instead of retraining
+  saved <- readRDS(results_file)
+  list2env(saved, envir = environment())
+}
+```
+
+```{r}
+#| label: final-evaluation
+y_valid <- as.numeric(valid$y)
+y_test  <- as.numeric(test$y)
+
+# Cut-off chosen on VALIDATION: 
+# accepting same-writer pairs and rejecting different-writer pairs.
+roc_valid <- roc(y_valid, -d_valid, direction = "<", quiet = TRUE)
+thr <- -as.numeric(coords(roc_valid, "best", ret = "threshold")$threshold[1])
+
+roc_test  <- roc(y_test, -d_test, direction = "<", quiet = TRUE)
+pred_same <- as.integer(d_test < thr)
+
+final_auc <- as.numeric(auc(roc_test))
+final_acc <- mean(pred_same == y_test)
+final_tpr <- mean(pred_same[y_test == 1] == 1)   # same writer correctly accepted
+final_fpr <- mean(pred_same[y_test == 0] == 1)   # different writer wrongly accepted
+
+# AUC within subsets of the test pairs
+auc_subset <- function(keep) {
+  as.numeric(auc(roc(y_test[keep], -d_test[keep], direction = "<", quiet = TRUE)))
+}
+same_digit <- digit[pairs_test[, 1]] == digit[pairs_test[, 2]]
+pair_type <- data.frame(
+  pair_type = c("Same digit", "Different digit"),
+  n_pairs   = c(sum(same_digit), sum(!same_digit)),
+  test_AUC  = c(auc_subset(same_digit), auc_subset(!same_digit))
+)
+by_digit <- data.frame(
+  digit    = 0:4,
+  test_AUC = sapply(0:4, function(d) auc_subset(digit[pairs_test[, 1]] == d))
+)
+
+# Sensitivity: how far does validation AUC move when each hyperparameter changes?
+range_emb <- tapply(settings$valid_auc, settings$lr,
+                    function(v) diff(range(v, na.rm = TRUE)))
+range_lr  <- tapply(settings$valid_auc, settings$emb_dim,
+                    function(v) diff(range(v, na.rm = TRUE)))
+sens <- c("embedding size" = max(range_emb, na.rm = TRUE),
+          "learning rate"  = max(range_lr,  na.rm = TRUE))
+most_sens  <- names(which.max(sens))
+least_sens <- names(which.min(sens))
+n_failed   <- sum(is.na(settings$valid_auc))
+```
+
+### Results
+
+@tbl-grid shows every combination of embedding size and learning rate, sorted by validation AUC. Validation AUC ranges only from 0.963 to 0.977, and test AUC from 0.973 to 0.978. Every combination learned to separate same-writer from different-writer pairs very well, which is why the bars in Figure 1 look almost identical. The best combination was an embedding size of **`r best$emb_dim`** with a learning rate of **`r best$lr`**, giving a validation AUC of **`r f3(best$valid_auc)`**. Validation AUC ranges only from 0.963 to 0.977, and test AUC from 0.973 to 0.978. Every combination learned to separate same-writer from different-writer pairs very well.Validation and test AUC also track each other closely: every model’s test AUC was within 0.010 of its validation AUC, and slightly higher in every case. Session 4 was therefore a reliable stand-in for an unseen session, and choosing settings on it did not mislead us about session 5.
+
+```{r}
+#| label: tbl-grid
+#| tbl-cap: "Grid search results, sorted by validation AUC. Gap = training AUC minus validation AUC."
+kable(settings[order(-settings$valid_auc), ], digits = 3, row.names = FALSE,
+      col.names = c("Embedding size", "Learning rate", "Epochs", "Train AUC",
+                    "Validation AUC", "Test AUC", "Gap"))
+```
+
+```{r}
+#| label: tbl-grid-wide
+#| tbl-cap: "Validation AUC by embedding size (rows) and learning rate (columns)."
+wide <- tapply(settings$valid_auc,
+               list(settings$emb_dim, settings$lr), mean)   
+kable(round(wide, 3))
+```
+
+### Sensitivity
+
+
+```{r}
+#| label: fig-sensitivity
+#| fig-cap: "Sensitivity of validation AUC to learning rate and embedding size."
+ggplot(settings, aes(x = factor(lr), y = valid_auc,
+                     colour = factor(emb_dim), group = factor(emb_dim))) +
+  geom_line() + geom_point(size = 3) +
+  labs(x = "Learning rate", y = "Validation AUC (session 4)", colour = "Embedding size")
+```
+
+
+@fig-sensitivity shows a clear pattern for embedding size. An embedding of 64 numbers was the weakest at every learning rate, and its disadvantage grew as the learning rate increased: validation AUC fell from 0.971 to 0.968 to 0.963. One plausible explanation is that, with more dimensions, the Euclidean distance adds up more squared differences, so small errors in individual dimensions accumulate.  Embedding sizes of 16 and 32 performed almost identically. This suggests that 16 numbers are already enough to describe the style differences between 20 writers, and extra dimensions add capacity the task does not need.
+
+The learning rate had a smaller and less consistent effect. For embedding sizes 16 and 32, validation AUC dipped slightly at 0.001 and rose at 0.01, but these movements are within about 0.006. 
+
+@fig-gap shows the overfitting gap: how much better each model does on the training pairs than on the validation pairs. A larger gap means the model has started memorising the training sessions rather than learning style that carries over to a new session.
+
+### Final model
+
+The final model reached a test AUC of 0.978. Moreover, it  classified 93.4% of test pairs correctly. It accepted 93.9% of genuine same-writer pairs and wrongly accepted 7.0% of different-writer pairs.
+
+```{r}
+#| label: tbl-final
+#| tbl-cap: "Final Siamese model: test performance (session 5)."
+kable(data.frame(
+  Measure = c("AUC",
+              "Accuracy (cut-off chosen on validation)",
+              "True match rate (same writer correctly accepted)",
+              "False match rate (different writer wrongly accepted)",
+              "Distance cut-off"),
+  Value = c(final_auc, final_acc, final_tpr, final_fpr, thr)
+), digits = 3)
+```
+
+```{r}
+#| label: tbl-confusion
+#| tbl-cap: "Final model: confusion table for the test pairs."
+kable(table(Predicted = ifelse(pred_same == 1, "Same", "Different"),
+            Actual    = ifelse(y_test == 1, "Same", "Different")))
+```
+
+The table above shows that of  the 2,488 same-writer test pairs, 2,335 were correctly accepted and 153 were wrongly rejected. Of the 2,512 different-writer pairs, 2,336 were correctly rejected and 176 were wrongly accepted. Overall the model made 329 errors in 5,000 decisions, split roughly evenly between the two types.
