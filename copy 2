@@ -1,6 +1,6 @@
 ---
 title: "Handwriting Analysis: Exploration, CNN and Experimental Setup"
-subtitle: "Questions 1, 2 and 4 — working report"
+subtitle: "Questions 1, 2, 4 and 5 — working report"
 format:
   html:
     toc: true
@@ -193,7 +193,9 @@ plot_panels(df)
 
 <!-- Q2 reuses the setup objects: x_train, x_val, x_test,
      y_train_person, y_val_person, meta_test, and the session row indices.
-
+     Q2 commentary was drafted with ChatGPT and must be accounted for
+     accurately in the final per-task AI-use statement. Verify the analysis
+     and comply with the assignment rules on authorship of report prose. -->
 
 ### Prediction Task and Model
 
@@ -205,7 +207,7 @@ The CNN contained two convolutional layers, with 32 and 64 filters respectively.
 
 The final layer had 20 softmax units, producing a probability distribution over the writer IDs. The writer with the highest probability was selected as the prediction. The labels were converted from IDs 1–20 to indices 0–19 and one-hot encoded for training. The model used categorical cross-entropy with the Adam optimiser, a learning rate of 0.0001 and a batch size of 64. A random seed of 2026 was set before building the model.
 
-Training was allowed to run for up to 30 epochs. Early stopping monitored validation loss, with patience of three epochs, and restored the weights from the epoch with the lowest validation loss. The validation session was therefore used to select the training duration.
+Training was allowed to run for up to 15 epochs. Early stopping monitored validation loss, with patience of three epochs, and restored the weights from the epoch with the lowest validation loss. The validation session was therefore used to select the training duration.
 
 ```{r}
 #| label: q2-cnn-fit
@@ -460,3 +462,211 @@ ggplot(split_df, aes(y = Split, x = Count, fill = Split)) +
   labs(x = "Total Image Count", y = NULL) +
   theme(legend.position = "none", panel.grid.major.y = element_blank())
 ```
+
+## Section 5: CNN Hyperparameter Tuning
+
+
+### Search Design
+
+A limited grid search was used to investigate whether changing the dense-layer size and learning rate improved the CNN's validation performance. These parameters were chosen because they affect different aspects of the model: dense-layer size changes the capacity of the final feature-combination stage, while learning rate controls the size of the Adam updates. The training curves in Section 2 showed overfitting, so smaller dense layers were included to test whether reducing capacity would improve performance on the validation session.
+
+The search considered 32, 64 and 128 dense units, together with learning rates of 0.0001, 0.0005 and 0.001, giving nine combinations. The original configuration of 128 dense units and a learning rate of 0.0001 was included as the baseline. The convolutional layers, dropout rate of 0.5, L2 penalty of 0.0001 and batch size of 64 were held fixed. Each model was trained for up to 15 epochs, with early stopping monitoring validation loss using patience of three epochs and restoration of the best weights. A fresh model and optimiser were created for each run, and the random seed was reset to 2026.
+
+The session split was unchanged: sessions 1–3 were used for training, session 4 for validation and session 5 for the final test comparison. The accuracy of each restored model was measured on session 4. This is important because the epoch with the lowest validation loss need not have the highest validation accuracy. The largest accuracy observed anywhere in a training history would not necessarily describe the weights retained by early stopping.
+
+The selection rule was the highest restored-model validation accuracy, using lower validation loss to break ties. Candidate rankings were based on validation results, rather than on the test scores.
+
+```{r}
+#| label: q5-recorded-results
+#| include: false
+
+# Recorded outputs from the nine runs supplied in the R console results.
+# These are actual recorded results, not estimated or simulated scores.
+# This block lets the report display those results without retraining.
+q5_settings <- data.frame(
+  dense_units = c(128L, 128L, 128L, 32L, 32L, 32L, 64L, 64L, 64L),
+  lr = c(0.0001, 0.0005, 0.001, 0.001, 0.0005, 0.0001,
+         0.0001, 0.001, 0.0005),
+  val_accuracy_percent = c(60.16, 55.34, 54.90, 52.74, 52.18,
+                           50.26, 50.12, 50.04, 46.26),
+  val_loss = c(1.299241, 1.413528, 1.660567, 1.624378, 1.621602,
+               1.590188, 1.514222, 1.583104, 1.551859),
+  selected_epoch = c(3L, 1L, 1L, 1L, 2L, 5L, 3L, 1L, 1L)
+)
+q5_comparison <- data.frame(
+  model = c("Q2 baseline", "Q5 selected configuration"),
+  test_accuracy_percent = c(63.3, 63.3)
+)
+```
+
+```{r}
+#| label: q5-repeat-search
+#| eval: false
+#| include: false
+
+# OPTIONAL REPRODUCTION: change eval to true to repeat the nine fits.
+# This reuses Q2's x_train, x_val, x_test, cnn_y_train and cnn_y_val.
+# It replaces the recorded result objects above with freshly computed results.
+
+q5_train_one <- function(dense_units, lr) {
+  clear_session()
+  set_random_seed(2026)
+  inp <- layer_input(shape = c(28, 28, 1))
+  out <- inp |>
+    layer_conv_2d(32, 3, padding = "same") |>
+    layer_activation("relu") |>
+    layer_max_pooling_2d(2) |>
+    layer_conv_2d(64, 3, padding = "same") |>
+    layer_activation("relu") |>
+    layer_max_pooling_2d(2) |>
+    layer_flatten() |>
+    layer_dense(dense_units, activation = "relu",
+                kernel_regularizer = regularizer_l2(0.0001)) |>
+    layer_dropout(0.5) |>
+    layer_dense(20, activation = "softmax")
+  candidate_model <- keras_model(inputs = inp, outputs = out)
+  compile(candidate_model, loss = "categorical_crossentropy",
+          optimizer = optimizer_adam(learning_rate = lr),
+          metrics = "accuracy", jit_compile = FALSE)
+  candidate_history <- fit(
+    candidate_model, x_train, cnn_y_train,
+    validation_data = list(x_val, cnn_y_val),
+    epochs = 15, batch_size = 64, shuffle = TRUE,
+    callbacks = list(callback_early_stopping(
+      monitor = "val_loss", patience = 3, restore_best_weights = TRUE
+    )),
+    verbose = 0, view_metrics = FALSE
+  )
+  scores <- evaluate(candidate_model, x_val, cnn_y_val,
+                     batch_size = 64, verbose = 0)
+  list(model = candidate_model,
+       accuracy = as.numeric(scores[["accuracy"]]),
+       loss = as.numeric(scores[["loss"]]),
+       selected_epoch = which.min(candidate_history$metrics$val_loss))
+}
+
+q5_settings <- expand.grid(dense_units = c(32, 64, 128),
+                           lr = c(0.0001, 0.0005, 0.001))
+q5_settings$val_accuracy_percent <- NA_real_
+q5_settings$val_loss <- NA_real_
+q5_settings$selected_epoch <- NA_integer_
+q5_best_accuracy <- -Inf
+q5_best_loss <- Inf
+q5_best_model <- NULL
+
+for (i in seq_len(nrow(q5_settings))) {
+  candidate <- q5_train_one(q5_settings$dense_units[i], q5_settings$lr[i])
+  q5_settings$val_accuracy_percent[i] <- 100 * candidate$accuracy
+  q5_settings$val_loss[i] <- candidate$loss
+  q5_settings$selected_epoch[i] <- candidate$selected_epoch
+  if (candidate$accuracy > q5_best_accuracy ||
+      (candidate$accuracy == q5_best_accuracy && candidate$loss < q5_best_loss)) {
+    q5_best_accuracy <- candidate$accuracy
+    q5_best_loss <- candidate$loss
+    q5_best_model <- candidate$model
+  }
+}
+
+# Test only the validation-selected candidate, after the search is complete.
+q5_test_predictions <- max.col(
+  predict(q5_best_model, x_test, verbose = 0), ties.method = "first"
+)
+q5_comparison <- data.frame(
+  model = c("Q2 baseline", "Q5 selected configuration"),
+  test_accuracy_percent = 100 * c(
+    cnn_accuracy, mean(q5_test_predictions == meta_test$person_id)
+  )
+)
+```
+
+```{r}
+#| label: q5-results-helpers
+#| include: false
+
+q5_settings <- q5_settings[
+  order(-q5_settings$val_accuracy_percent, q5_settings$val_loss),
+]
+rownames(q5_settings) <- NULL
+q5_best <- q5_settings[1, , drop = FALSE]
+q5_score <- function(units, rate) {
+  q5_settings$val_accuracy_percent[
+    q5_settings$dense_units == units & q5_settings$lr == rate
+  ]
+}
+q5_original_selected <- (
+  q5_best$dense_units == 128 && q5_best$lr == 0.0001
+)
+q5_test_difference <- diff(q5_comparison$test_accuracy_percent)
+```
+
+### Validation Results
+
+```{r}
+#| label: tbl-cnn-tuning
+#| tbl-cap: "Validation performance of the nine CNN hyperparameter configurations."
+
+q5_table <- q5_settings
+q5_table$lr <- sprintf("%.4f", q5_table$lr)
+knitr::kable(
+  q5_table,
+  col.names = c("Dense units", "Learning rate", "Validation accuracy (%)",
+                "Validation loss", "Selected epoch"),
+  digits = c(0, 4, 2, 4, 0),
+  row.names = FALSE
+)
+```
+
+@tbl-cnn-tuning shows that the highest validation accuracy was **`r sprintf("%.2f", q5_best$val_accuracy_percent)`%**, obtained with **`r q5_best$dense_units` dense units and a learning rate of `r format(q5_best$lr, scientific = FALSE)`**. Its selected checkpoint was epoch `r q5_best$selected_epoch`, with validation loss of `r sprintf("%.4f", q5_best$val_loss)`. `r if (q5_original_selected) "The search therefore selected the original Q2 configuration." else "The search selected a different configuration from the Q2 baseline."` The difference between the highest and lowest validation accuracies across the grid was `r sprintf("%.2f", diff(range(q5_settings$val_accuracy_percent)))` percentage points, showing that the choice of settings affected performance within the tested range.
+
+### Sensitivity to Dense-Layer Size and Learning Rate
+
+```{r}
+#| label: fig-cnn-tuning-sensitivity
+#| fig-cap: "Validation accuracy across learning rates for each dense-layer size. All runs used seed 2026."
+#| fig-width: 7
+#| fig-height: 4.5
+
+q5_plot <- q5_settings
+q5_plot$learning_rate <- factor(
+  q5_plot$lr, levels = c(0.0001, 0.0005, 0.001),
+  labels = c("0.0001", "0.0005", "0.001")
+)
+ggplot(q5_plot, aes(
+  x = learning_rate, y = val_accuracy_percent,
+  colour = factor(dense_units), group = factor(dense_units)
+)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2.5) +
+  labs(x = "Learning rate", y = "Validation accuracy (%)",
+       colour = "Dense units") +
+  theme_minimal(base_size = 12)
+```
+
+Dense-layer size had a noticeable effect on validation performance (@fig-cnn-tuning-sensitivity). The 128-unit model performed better than the 32- and 64-unit models at each of the three learning rates. At a learning rate of 0.0001, validation accuracy was `r sprintf("%.2f", q5_score(32, 0.0001))`% with 32 units, `r sprintf("%.2f", q5_score(64, 0.0001))`% with 64 units and `r sprintf("%.2f", q5_score(128, 0.0001))`% with 128 units. Reducing the dense-layer size therefore did not improve validation performance in these runs. Although the initial CNN showed overfitting, this does not imply that every reduction in model capacity will improve its ability to generalise.
+
+The effect of learning rate depended on the dense-layer size. For the 128-unit model, increasing the learning rate from 0.0001 to 0.0005 reduced validation accuracy from `r sprintf("%.2f", q5_score(128, 0.0001))`% to `r sprintf("%.2f", q5_score(128, 0.0005))`%. Increasing it further to 0.001 gave `r sprintf("%.2f", q5_score(128, 0.001))`%. In contrast, the 32-unit model improved from `r sprintf("%.2f", q5_score(32, 0.0001))`% at the lowest learning rate to `r sprintf("%.2f", q5_score(32, 0.001))`% at the highest. The 64-unit model had its lowest accuracy at the intermediate learning rate. The differing trends indicate that the learning-rate effect should be considered together with model capacity, rather than assuming that one learning rate is uniformly better for all architectures.
+
+Most configurations with the two higher learning rates selected an early checkpoint. This describes when their lowest monitored validation loss occurred; it does not, by itself, establish the reason for their lower accuracy. The comparisons concern the complete training procedure, including the 15-epoch limit and early-stopping rule, rather than the performance each architecture might achieve under an unlimited training budget.
+
+### Test Comparison with the Q2 Baseline
+
+```{r}
+#| label: tbl-cnn-tuning-test
+#| tbl-cap: "Test accuracy of the baseline and validation-selected CNN configuration."
+
+knitr::kable(
+  q5_comparison,
+  col.names = c("Model", "Test accuracy (%)"),
+  digits = c(0, 2), row.names = FALSE
+)
+```
+
+The Q2 baseline achieved `r sprintf("%.2f", q5_comparison$test_accuracy_percent[1])`% test accuracy, and the validation-selected configuration achieved `r sprintf("%.2f", q5_comparison$test_accuracy_percent[2])`% (@tbl-cnn-tuning-test). `r if (q5_original_selected && abs(q5_test_difference) < 1e-8) "This unchanged result is expected because the search selected the same architecture and learning rate as the baseline, using the same seed and training procedure. These should not be interpreted as two independent confirmations of performance." else paste0("The difference was ", sprintf("%.2f", q5_test_difference), " percentage points. The test comparison assesses the configuration selected using validation data; it was not the criterion used to rank candidates.")`
+
+The purpose of tuning was to compare plausible settings and assess sensitivity, rather than to guarantee an improvement. In this search, the alternative configurations did not outperform the original configuration on validation accuracy. Retaining the baseline was therefore supported by the observed validation results.
+
+### Limitations
+
+This was a small, single-seed search over a specified grid. Resetting the seed made the procedure more repeatable, but it did not measure how the rankings might change with different initial weights or training randomness. There were also no repeated validation-session splits, so the results do not quantify sensitivity to the choice of held-out session. The selected configuration should therefore be described as the best among those tested under this procedure, rather than as a globally optimal CNN.
+
+Test performance had already been inspected during the earlier analysis. Any further model choices should continue to be based on validation results, and the final test score should not be presented as a completely untouched estimate after all exploratory decisions. No results from the proposed six-configuration follow-up search are included here.
