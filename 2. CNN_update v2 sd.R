@@ -51,7 +51,7 @@ output <- input |>
 
 model <- keras_model(inputs = input, outputs = output)
 
-# 5. Compile with a much slower, protective learning rate
+# 5. Compile withlearning rate
 compile(model,
         loss = "categorical_crossentropy",
         optimizer = optimizer_adam(learning_rate = 0.001),   # was 0.0001
