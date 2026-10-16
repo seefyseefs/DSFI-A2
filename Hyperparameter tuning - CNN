@@ -1,0 +1,130 @@
+# Train and evaluate one hyperparameter combination
+q5_train_one <- function(dense_units, lr) {
+  clear_session()
+  set_random_seed(2026)
+
+  inp <- layer_input(shape = c(28, 28, 1))
+
+  out <- inp |>
+    layer_conv_2d(32, 3, padding = "same") |>
+    layer_activation("relu") |>
+    layer_max_pooling_2d(2) |>
+    layer_conv_2d(64, 3, padding = "same") |>
+    layer_activation("relu") |>
+    layer_max_pooling_2d(2) |>
+    layer_flatten() |>
+    layer_dense(
+      dense_units,
+      activation = "relu",
+      kernel_regularizer = regularizer_l2(0.0001)
+    ) |>
+    layer_dropout(0.5) |>
+    layer_dense(20, activation = "softmax")
+
+  candidate_model <- keras_model(inputs = inp, outputs = out)
+
+  compile(
+    candidate_model,
+    loss = "categorical_crossentropy",
+    optimizer = optimizer_adam(learning_rate = lr),
+    metrics = "accuracy",
+    jit_compile = FALSE
+  )
+
+  candidate_history <- fit(
+    candidate_model,
+    x_train,
+    cnn_y_train,
+    validation_data = list(x_val, cnn_y_val),
+    epochs = 15,
+    batch_size = 64,
+    shuffle = TRUE,
+    callbacks = list(
+      callback_early_stopping(
+        monitor = "val_loss",
+        patience = 3,
+        restore_best_weights = TRUE
+      )
+    ),
+    verbose = 0,
+    view_metrics = FALSE
+  )
+
+  scores <- evaluate(
+    candidate_model,
+    x_val,
+    cnn_y_val,
+    batch_size = 64,
+    verbose = 0
+  )
+
+  list(
+    model = candidate_model,
+    accuracy = as.numeric(scores[["accuracy"]]),
+    loss = as.numeric(scores[["loss"]]),
+    selected_epoch = which.min(candidate_history$metrics$val_loss)
+  )
+}
+
+# Define the nine hyperparameter combinations
+q5_settings <- expand.grid(
+  dense_units = c(32, 64, 128),
+  lr = c(0.0001, 0.0005, 0.001)
+)
+
+q5_settings$val_accuracy_percent <- NA_real_
+q5_settings$val_loss <- NA_real_
+q5_settings$selected_epoch <- NA_integer_
+
+q5_best_accuracy <- -Inf
+q5_best_loss <- Inf
+q5_best_model <- NULL
+
+# Fit every combination and select using validation results
+for (i in seq_len(nrow(q5_settings))) {
+  candidate <- q5_train_one(
+    q5_settings$dense_units[i],
+    q5_settings$lr[i]
+  )
+
+  q5_settings$val_accuracy_percent[i] <- 100 * candidate$accuracy
+  q5_settings$val_loss[i] <- candidate$loss
+  q5_settings$selected_epoch[i] <- candidate$selected_epoch
+
+  if (
+    candidate$accuracy > q5_best_accuracy ||
+    (candidate$accuracy == q5_best_accuracy &&
+     candidate$loss < q5_best_loss)
+  ) {
+    q5_best_accuracy <- candidate$accuracy
+    q5_best_loss <- candidate$loss
+    q5_best_model <- candidate$model
+  }
+}
+
+# Sort results: highest validation accuracy, then lowest loss
+q5_settings <- q5_settings[
+  order(-q5_settings$val_accuracy_percent, q5_settings$val_loss),
+]
+
+rownames(q5_settings) <- NULL
+q5_best <- q5_settings[1, , drop = FALSE]
+
+print(q5_settings)
+print(q5_best)
+
+# Evaluate only the selected model on the test session
+q5_test_predictions <- max.col(
+  predict(q5_best_model, x_test, verbose = 0),
+  ties.method = "first"
+)
+
+q5_comparison <- data.frame(
+  model = c("Q2 baseline", "Q5 selected configuration"),
+  test_accuracy_percent = 100 * c(
+    cnn_accuracy,
+    mean(q5_test_predictions == meta_test$person_id)
+  )
+)
+
+print(q5_comparison)
