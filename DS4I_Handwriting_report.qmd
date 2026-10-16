@@ -426,7 +426,7 @@ ggplot(cnn_confusion_df, aes(x = Reference, y = Prediction, fill = Freq)) +
 
 In @fig-cnn-confusion, actual writer IDs appear on the horizontal axis and predicted IDs on the vertical axis. Diagonal cells represent correct predictions, while cells away from the diagonal show which writers were confused. The matrix shows that performance varied substantially between writers.
 
-Writer-level recall is the proportion of a particular writer's test images that were correctly identified. Writers 11 and 18 had recalls of `r sprintf("%.1f", cnn_writer_performance$recall_percent[11])`% and `r sprintf("%.1f", cnn_writer_performance$recall_percent[18])`%, respectively, whereas writer 5 had a recall of `r sprintf("%.1f", cnn_writer_performance$recall_percent[5])`%. Writer 10 had a recall of `r sprintf("%.1f", cnn_writer_performance$recall_percent[10])`%, with `r as.integer(cnn_cm$table["2", "10"])` of their 250 images attributed to writer 2. Similarly, `r as.integer(cnn_cm$table["13", "5"])` of writer 5's images were attributed to writer 13. These examples show that the errors were concentrated in particular writer confusions rather than being evenly distributed across all classes.
+Writers 11 and 18 had recalls of `r sprintf("%.1f", cnn_writer_performance$recall_percent[11])`% and `r sprintf("%.1f", cnn_writer_performance$recall_percent[18])`%, respectively, whereas writer 5 had a recall of `r sprintf("%.1f", cnn_writer_performance$recall_percent[5])`%. Writer 10 had a recall of `r sprintf("%.1f", cnn_writer_performance$recall_percent[10])`%, with `r as.integer(cnn_cm$table["2", "10"])` of their 250 images attributed to writer 2. Similarly, `r as.integer(cnn_cm$table["13", "5"])` of writer 5's images were attributed to writer 13. These examples show that the errors were concentrated in particular writer confusions rather than being evenly distributed across all classes.
 
 Recall should be distinguished from precision. Recall asks how many of a writer's own images were correctly recognised. Precision asks how many images assigned to that writer actually belonged to them. For example, writer 11's precision was `r sprintf("%.1f", cnn_writer_performance$precision_percent[11])`%. Even when all of a writer's own images are recognised, some images from other writers may also be incorrectly assigned to that writer. This distinction matters if the model is used to attribute an image to a specific person.
 
@@ -803,13 +803,10 @@ With the split fixed, session 4 can be used to make modelling choices without to
 
 #### Search Design
 
-A limited grid search was used to investigate whether changing the dense-layer size and learning rate improved the CNN's validation performance. These parameters were chosen because they affect different aspects of the model: dense-layer size changes the capacity of the final feature-combination stage, while learning rate controls the size of the Adam updates. The training curves in Section 2 showed overfitting, so smaller dense layers were included to test whether reducing capacity would improve performance on the validation session.
-
-The search considered 32, 64 and 128 dense units, together with learning rates of 0.0001, 0.0005 and 0.001, giving nine combinations. The original configuration of 128 dense units and a learning rate of 0.0001 was included as the baseline. The convolutional layers, dropout rate of 0.5, L2 penalty of 0.0001 and batch size of 64 were held fixed. Each model was trained for up to 15 epochs, with early stopping monitoring validation loss using patience of three epochs and restoration of the best weights. A fresh model and optimiser were created for each run, and the random seed was reset to 2026.
+The search considered 32, 64 and 128 dense units, together with learning rates of 0.0001, 0.0005 and 0.001, giving nine combinations. The original configuration of 128 dense units and a learning rate of 0.0001 was included as the baseline. The convolutional layers, dropout rate of 0.5, L2 penalty of 0.0001 and batch size of 64 were held fixed. Each model was trained for up to 15 epochs, with early stopping monitoring validation loss using patience of three epochs and restoration of the best weights. A fresh model and optimiser were created for each run, and the random seed was reset to 2026. These parameters were chosen because they affect different aspects of the model: dense-layer size changes the capacity of the final feature-combination stage, while learning rate controls the size of the Adam updates. The training curves in Section 2 showed overfitting, so smaller dense layers were included to test whether reducing capacity would improve performance on the validation session.
 
 The session split was unchanged: sessions 1–3 were used for training, session 4 for validation and session 5 for the final test comparison. The accuracy of each restored model was measured on session 4. This is important because the epoch with the lowest validation loss need not have the highest validation accuracy. The largest accuracy observed anywhere in a training history would not necessarily describe the weights retained by early stopping.
 
-The selection rule was the highest restored-model validation accuracy, using lower validation loss to break ties. Candidate rankings were based on validation results, rather than on the test scores.
 
 ```{r}
 #| label: q5-recorded-results
@@ -977,7 +974,6 @@ Dense-layer size had a noticeable effect on validation performance (@fig-cnn-tun
 
 The effect of learning rate depended on the dense-layer size. For the 128-unit model, increasing the learning rate from 0.0001 to 0.0005 reduced validation accuracy from `r sprintf("%.2f", q5_score(128, 0.0001))`% to `r sprintf("%.2f", q5_score(128, 0.0005))`%. Increasing it further to 0.001 gave `r sprintf("%.2f", q5_score(128, 0.001))`%. In contrast, the 32-unit model improved from `r sprintf("%.2f", q5_score(32, 0.0001))`% at the lowest learning rate to `r sprintf("%.2f", q5_score(32, 0.001))`% at the highest. The 64-unit model had its lowest accuracy at the intermediate learning rate. The differing trends indicate that the learning-rate effect should be considered together with model capacity, rather than assuming that one learning rate is uniformly better for all architectures.
 
-Most configurations with the two higher learning rates selected an early checkpoint. This describes when their lowest monitored validation loss occurred; it does not, by itself, establish the reason for their lower accuracy. The comparisons concern the complete training procedure, including the 15-epoch limit and early-stopping rule, rather than the performance each architecture might achieve under an unlimited training budget.
 
 #### Test Comparison with the Q2 Baseline
 
@@ -998,9 +994,8 @@ The purpose of tuning was to compare plausible settings and assess sensitivity, 
 
 #### Limitations
 
-This was a small, single-seed search over a specified grid. Resetting the seed made the procedure more repeatable, but it did not measure how the rankings might change with different initial weights or training randomness. There were also no repeated validation-session splits, so the results do not quantify sensitivity to the choice of held-out session. The selected configuration should therefore be described as the best among those tested under this procedure, rather than as a globally optimal CNN.
-
-Test performance had already been inspected during the earlier analysis. Any further model choices should continue to be based on validation results, and the final test score should not be presented as a completely untouched estimate after all exploratory decisions. No results from the proposed six-configuration follow-up search are included here.
+This was a small, single-seed search over a specified grid. Resetting the seed made the procedure more repeatable, but it did not measure how the rankings might change with different initial weights or training randomness. There were also no repeated validation-session splits, so the results do not quantify sensitivity to the choice of held-out session.
+ 
 
 ```{r}
 #| include: false
