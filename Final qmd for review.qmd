@@ -1,6 +1,6 @@
 ---
-title: "Handwriting Analysis: Exploration, CNN and Experimental Setup"
-subtitle: "Questions 1, 2, 4 and 5 — working report"
+title: "Handwriting Analysis: Writer Identification and Verification"
+subtitle: "Sections 1 to 5"
 format:
   html:
     toc: true
@@ -15,11 +15,18 @@ execute:
   message: false
 ---
 
-```{r setup}
-reticulate::py_require(python_version = "3.11")
+```{r setup1}
 library(keras3)
-use_backend("tensorflow", gpu = FALSE)
 library(tidyverse)
+library(dplyr)
+library(knitr)
+library(caret)
+library(pROC)
+library(reticulate)
+py_require(python_version = "3.12")
+use_backend("tensorflow")
+set_random_seed(2026)
+
 
 data <- readRDS("handwriting.rds")
 x_scaled <- data$images / 255
@@ -67,10 +74,16 @@ y_train_person <- y_all_person[train_rows]
 y_val_person   <- y_all_person[val_rows]
 y_test_person  <- y_all_person[test_rows]
 
-# --- Partition Metadata (for Siamese Pair Construction) ---
+meta <- data$metadata
+
+# --- Partition Metadata (used by the CNN in Section 2) ---
 meta_train <- data$metadata[train_rows, ]
 meta_val   <- data$metadata[val_rows, ]
 meta_test  <- data$metadata[test_rows, ]
+
+person  <- meta$person_id               # the "class label" for the Siamese task
+session <- meta$session
+digit   <- meta$digit
 
 ```
 
@@ -188,8 +201,7 @@ plot_panels(df)
 ```
 
 
-
-## Section 2: CNN
+## Section 2: CNN Writer Identification
 
 ### Prediction Task and Model
 
@@ -201,7 +213,7 @@ The CNN contained two convolutional layers, with 32 and 64 filters respectively.
 
 The final layer had 20 softmax units, producing a probability distribution over the writer IDs. The writer with the highest probability was selected as the prediction. The labels were converted from IDs 1–20 to indices 0–19 and one-hot encoded for training. The model used categorical cross-entropy with the Adam optimiser, a learning rate of 0.0001 and a batch size of 64. A random seed of 2026 was set before building the model.
 
-Training was allowed to run for up to 15 epochs. Early stopping monitored validation loss, with patience of three epochs, and restored the weights from the epoch with the lowest validation loss. The validation session was therefore used to select the training duration.
+Training was allowed to run for up to 30 epochs. Early stopping monitored validation loss, with patience of three epochs, and restored the weights from the epoch with the lowest validation loss. The validation session was therefore used to select the training duration.
 
 ```{r}
 #| label: q2-cnn-fit
@@ -221,9 +233,11 @@ cnn_output <- cnn_input |>
   layer_conv_2d(32, 3, padding = "same") |>
   layer_activation("relu") |>
   layer_max_pooling_2d(2) |>
+  layer_dropout(rate = 0.3) |> 
   layer_conv_2d(64, 3, padding = "same") |>
   layer_activation("relu") |>
   layer_max_pooling_2d(2) |>
+  layer_dropout(rate = 0.3) |> 
   layer_flatten() |>
   layer_dense(
     128,
@@ -410,6 +424,10 @@ The CNN provides a baseline for recognising these 20 writers across recording se
 
 The evaluation concerns new-session images from known writers. It does not measure the ability to identify a person who was absent from training, and the classifier will still choose one of the 20 IDs if presented with such a person. Testing on one held-out session also does not quantify how performance varies across other possible sessions. Finally, because the images were simulated, these results should not be taken as evidence of equivalent performance on real handwriting.
 
+<<<<<<< HEAD
+=======
+
+>>>>>>> a47c1618f83f0966ab7902aa7dd501d6cfb76b16
 ## Section 3: Writer Verification using a Siamese Network
 
 ### Data Preparation
@@ -422,9 +440,9 @@ Training examples were created as pairs of images. For each pair, there was a 50
 
 A label of 1 was assigned if the two images were written by the same person, and a label of 0 was assigned if they were written by different people. This balanced set of positive and negative pairs allowed the model to learn writer similarity.
 
-```{r tab-pairs}
+```{r}
 #| label: tbl-make_pairs
-#| tbl-cap: "Test Set Performance Metrics for the Siamese Network"
+#| tbl-cap: "Number of pairs and proportion of same-writer pairs in each split."
 make_pairs <- function(ids, n, class_labels = person) {
   a <- sample(ids, n, replace = TRUE)
   b <- vapply(a, function(i) {
@@ -633,7 +651,7 @@ The final model was evaluated on the independent test set from session 5. Matchi
 - F1 Score: harmonic mean of precision and recall.
 - Area Under the ROC Curve (AUC): measures how well the model separates same-writer and different-writer pairs across all possible thresholds.
 
-```{r tab-evalmetrics}
+```{r}
 #| label: tbl-metrics
 #| tbl-cap: "Test Set Performance Metrics for the Siamese Network"
 
@@ -685,7 +703,7 @@ kable(metrics_table)
 
 @tbl-metrics shows that the Siamese network achieved strong writer verification performance on the independent test set. Using the selected distance threshold, the model achieved an accuracy of 92.42%, indicating that most image pairs were classified correctly. The recall (92.98%) shows that the network successfully identified the majority of pairs written by the same writer, while the precision (92.07%) indicates that most pairs predicted as belonging to the same writer were correct. The F1-score of 92.52% demonstrates a good balance between precision and recall. Furthermore, the false positive rate (8.15%) and false negative rate (7.02%) were relatively low, suggesting that the model makes few matching errors.
 
-```{r fig-ROCcurve}
+```{r}
 #| label: fig-ROC
 #| fig-cap: "Siamese Network ROC"
 #| fig-width: 7
@@ -751,6 +769,8 @@ ggplot(split_df, aes(y = Split, x = Count, fill = Split)) +
   labs(x = "Total Image Count", y = NULL) +
   theme(legend.position = "none", panel.grid.major.y = element_blank())
 ```
+
+
 ## Section 5: CNN Hyperparameter Tuning
 
 
@@ -960,6 +980,8 @@ This was a small, single-seed search over a specified grid. Resetting the seed m
 Test performance had already been inspected during the earlier analysis. Any further model choices should continue to be based on validation results, and the final test score should not be presented as a completely untouched estimate after all exploratory decisions. No results from the proposed six-configuration follow-up search are included here.
 ```
 
+```{r}
+#| include: false
 RETRAIN <- TRUE
 results_file <- "siamese_tuning_results.rds"
 
@@ -1016,7 +1038,7 @@ make_batch <- function(p, images = x, class_labels = person) {
        y     = y)
 }
 
-set.seed(25)                       # same pairs every time the document is rendered
+set_random_seed(2026)                     # same pairs every time the document is rendered
 pairs_train <- make_pairs(train_ids, 20000)
 pairs_valid <- make_pairs(valid_ids, 5000)
 pairs_test  <- make_pairs(test_ids,  5000)
@@ -1039,7 +1061,7 @@ contrastive_loss <- function(y, d) {
 train_one_model <- function(emb_dim, lr) {
 
   clear_session()          # wipe the previous model from memory
-  set_random_seed(25)      # same starting weights for every model
+  set_random_seed(2026)      # same starting weights for every model
 
   # Encoder
   image <- layer_input(shape = c(28, 28, 1))
@@ -1181,7 +1203,7 @@ n_failed   <- sum(is.na(settings$valid_auc))
 
 ### Results
 
-@tbl-grid shows every combination of embedding size and learning rate, sorted by validation AUC. Validation AUC ranges only from 0.963 to 0.977, and test AUC from 0.973 to 0.978. Every combination learned to separate same-writer from different-writer pairs very well, which is why the bars in Figure 1 look almost identical. The best combination was an embedding size of **`r best$emb_dim`** with a learning rate of **`r best$lr`**, giving a validation AUC of **`r f3(best$valid_auc)`**. Validation AUC ranges only from 0.963 to 0.977, and test AUC from 0.973 to 0.978. Every combination learned to separate same-writer from different-writer pairs very well.Validation and test AUC also track each other closely: every model’s test AUC was within 0.010 of its validation AUC, and slightly higher in every case. Session 4 was therefore a reliable stand-in for an unseen session, and choosing settings on it did not mislead us about session 5.
+@tbl-grid shows every combination of embedding size and learning rate, sorted by validation AUC. Validation AUC ranges only from 0.963 to 0.977, and test AUC from 0.973 to 0.978. Every combination learned to separate same-writer from different-writer pairs very well. The best combination was an embedding size of **`r best$emb_dim`** with a learning rate of **`r best$lr`**, giving a validation AUC of **`r f3(best$valid_auc)`**. Validation and test AUC also track each other closely: every model’s test AUC was within 0.010 of its validation AUC, and slightly higher in every case. Session 4 was therefore a reliable stand-in for an unseen session, and choosing settings on it did not mislead us about session 5.
 
 ```{r}
 #| label: tbl-grid
@@ -1216,7 +1238,6 @@ ggplot(settings, aes(x = factor(lr), y = valid_auc,
 
 The learning rate had a smaller and less consistent effect. For embedding sizes 16 and 32, validation AUC dipped slightly at 0.001 and rose at 0.01, but these movements are within about 0.006. 
 
-@fig-gap shows the overfitting gap: how much better each model does on the training pairs than on the validation pairs. A larger gap means the model has started memorising the training sessions rather than learning style that carries over to a new session.
 
 ### Final model
 
@@ -1243,3 +1264,6 @@ kable(table(Predicted = ifelse(pred_same == 1, "Same", "Different"),
 ```
 
 The table above shows that of  the 2,488 same-writer test pairs, 2,335 were correctly accepted and 153 were wrongly rejected. Of the 2,512 different-writer pairs, 2,336 were correctly rejected and 176 were wrongly accepted. Overall the model made 329 errors in 5,000 decisions, split roughly evenly between the two types.
+
+
+
