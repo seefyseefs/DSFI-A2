@@ -1,0 +1,145 @@
+library(keras3)
+library(caret)
+
+use_backend("tensorflow")
+
+# 1. Load and scale images
+data <- readRDS("handwriting.rds")
+
+x_all <- data$images / 255
+y_all_person <- data$metadata$person_id - 1L
+
+# 2. Split by recording session
+train_rows <- which(data$metadata$session %in% 1:3)
+val_rows <- which(data$metadata$session == 4)
+test_rows <- which(data$metadata$session == 5)
+
+x_train <- x_all[train_rows, , , , drop = FALSE]
+x_val <- x_all[val_rows, , , , drop = FALSE]
+x_test <- x_all[test_rows, , , , drop = FALSE]
+
+y_train_person <- y_all_person[train_rows]
+y_val_person <- y_all_person[val_rows]
+
+meta_test <- data$metadata[test_rows, ]
+
+# 3. Reset session and encode writer labels
+clear_session()
+set_random_seed(2026)
+
+cnn_y_train <- to_categorical(y_train_person, num_classes = 20)
+cnn_y_val <- to_categorical(y_val_person, num_classes = 20)
+
+# 4. Build CNN
+cnn_input <- layer_input(shape = c(28, 28, 1))
+
+cnn_output <- cnn_input |>
+  layer_conv_2d(32, 3, padding = "same") |>
+  layer_activation("relu") |>
+  layer_max_pooling_2d(2) |>
+  layer_dropout(rate = 0.3) |>
+  layer_conv_2d(64, 3, padding = "same") |>
+  layer_activation("relu") |>
+  layer_max_pooling_2d(2) |>
+  layer_dropout(rate = 0.3) |>
+  layer_flatten() |>
+  layer_dense(
+    128,
+    activation = "relu",
+    kernel_regularizer = regularizer_l2(0.0001)
+  ) |>
+  layer_dropout(0.5) |>
+  layer_dense(20, activation = "softmax")
+
+cnn_model <- keras_model(
+  inputs = cnn_input,
+  outputs = cnn_output
+)
+
+# 5. Compile
+compile(
+  cnn_model,
+  loss = "categorical_crossentropy",
+  optimizer = optimizer_adam(learning_rate = 0.0001),
+  metrics = "accuracy",
+  jit_compile = FALSE
+)
+
+# 6. Early stopping
+cnn_early_stop <- callback_early_stopping(
+  monitor = "val_loss",
+  patience = 3,
+  restore_best_weights = TRUE
+)
+
+# 7. Train
+cnn_history <- fit(
+  cnn_model,
+  x_train,
+  cnn_y_train,
+  epochs = 15,
+  batch_size = 64,
+  validation_data = list(x_val, cnn_y_val),
+  shuffle = TRUE,
+  verbose = 0,
+  callbacks = list(cnn_early_stop),
+  view_metrics = FALSE
+)
+
+# 8. Predict writer IDs on the test session
+cnn_probabilities <- predict(cnn_model, x_test, verbose = 0)
+
+cnn_predicted_writer <- max.col(
+  cnn_probabilities,
+  ties.method = "first"
+)
+
+cnn_actual_writer <- meta_test$person_id
+cnn_correct <- cnn_predicted_writer == cnn_actual_writer
+cnn_accuracy <- mean(cnn_correct)
+
+cnn_best_epoch <- which.min(cnn_history$metrics$val_loss)
+cnn_epochs_run <- length(cnn_history$metrics$loss)
+
+cat("Test accuracy:", round(100 * cnn_accuracy, 2), "%\n")
+cat("Best epoch:", cnn_best_epoch, "\n")
+cat("Epochs run:", cnn_epochs_run, "\n")
+
+# 9. Writer identification accuracy by digit
+cnn_results_by_digit <- do.call(
+  rbind,
+  lapply(0:4, function(d) {
+    rows <- meta_test$digit == d
+
+    data.frame(
+      digit = d,
+      n_images = sum(rows),
+      n_correct = sum(cnn_correct[rows]),
+      writer_accuracy_percent = round(
+        100 * mean(cnn_correct[rows]), 1
+      )
+    )
+  })
+)
+
+print(cnn_results_by_digit)
+
+# 10. Confusion matrix
+cnn_cm <- caret::confusionMatrix(
+  data = factor(cnn_predicted_writer, levels = 1:20),
+  reference = factor(cnn_actual_writer, levels = 1:20)
+)
+
+print(cnn_cm)
+
+# 11. Recall and precision for each writer
+cnn_writer_performance <- data.frame(
+  writer = 1:20,
+  recall_percent = 100 * diag(cnn_cm$table) / colSums(cnn_cm$table),
+  precision_percent = 100 * diag(cnn_cm$table) / rowSums(cnn_cm$table)
+)
+
+print(cnn_writer_performance)
+
+# 12. Training curves
+plot(cnn_history)
