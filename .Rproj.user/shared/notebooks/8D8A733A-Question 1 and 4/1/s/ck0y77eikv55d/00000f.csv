@@ -1,0 +1,4 @@
+"0","contrastive_loss <- function(y, d) {"
+"0","  op_mean(y * op_square(d) +"
+"0","            (1 - y) * op_square(op_maximum(1 - d, 0)))"
+"0","}"

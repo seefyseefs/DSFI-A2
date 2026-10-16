@@ -439,15 +439,11 @@ The CNN identified the correct writer for `r sprintf("%.1f", 100 * cnn_accuracy)
 
 ## Section 3: Writer Verification using a Siamese Network
 
-### Data Preparation
-
-The handwriting images were loaded and scaled by dividing the pixel values by 255. This converted all pixel values to the range 0 to 1, which helps the neural network train more effectively. The data was split by session to avoid data leakage. Sessions 1 to 3 were used for training, session 4 for validation, and session 5 for testing.
+The objective for this section is to develop and evaluate a Siamese neural network for writer verification, where the objective is to determine whether two handwritten digit images were produced by the same writer.
 
 ### Construction of Training Examples
 
-Training examples were created as pairs of images. For each pair, there was a 50% chance that both images came from the same writer and a 50% chance that they came from different writers.
-
-A label of 1 was assigned if the two images were written by the same person, and a label of 0 was assigned if they were written by different people. This balanced set of positive and negative pairs allowed the model to learn writer similarity.
+Image pairs were generated with equal proportions of same-writer and different-writer examples. Labels of 1 and 0 were assigned respectively, providing a balanced dataset for writer verification.
 
 ```{r}
 #| label: tbl-make_pairs
@@ -509,9 +505,7 @@ kable(pair_summary)
 
 ### Shared Encoder Network
 
-A convolutional neural network (CNN) was used as the shared encoder. The encoder consisted of three convolutional layers with ReLU activation functions and max-pooling layers for feature extraction.
-
-The encoder transformed each handwriting image into a compact feature representation that captured important writer characteristics.
+A convolutional neural network (CNN) was used as the shared encoder. The encoder consisted of three convolutional layers with ReLU activation functions and max-pooling layers for feature extraction. The encoder transformed each handwriting image into a compact feature representation that captured important writer characteristics.
 
 ```{r}
 image <- layer_input(shape = c(28, 28, 1))
@@ -529,9 +523,7 @@ encoder <- keras_model(image, z)
 
 ### Siamese Network Architecture
 
-The Siamese network contained two identical branches that shared the same encoder weights. Each branch processed one image from a pair.
-
-The feature vectors produced by the encoder were compared using Euclidean distance. Small distances indicated that the images were likely written by the same person, while larger distances suggested different writers.
+The Siamese network contained two identical branches that shared the same encoder weights. Each branch processed one image from a pair. The feature vectors produced by the encoder were compared using Euclidean distance. Small distances indicated that the images were likely written by the same person, while larger distances suggested different writers.
 
 ```{r}
 a <- layer_input(shape = c(28, 28, 1))
@@ -547,9 +539,7 @@ model <- keras_model(list(a, b), distance)
 
 ### Contrastive Loss Function
 
-The model was trained using contrastive loss with a margin of 1.
-
-For pairs from the same writer, the loss function encouraged the distance between embeddings to become smaller. For pairs from different writers, the loss function encouraged the distance to be greater than the margin. This helped the network learn a feature space where handwriting from the same writer was grouped together and handwriting from different writers was separated.
+The model used contrastive loss with a margin of 1, encouraging same-writer pairs to have similar embeddings and different-writer pairs to be further apart. This created a feature space that distinguished writers effectively.
 
 ```{r}
 contrastive_loss <- function(y, d) {
@@ -560,7 +550,7 @@ contrastive_loss <- function(y, d) {
 
 ### Model Training
 
-The model was trained using the Adam optimiser with a learning rate of 0.001. Training was performed for up to 20 epochs with a batch size of 64.
+The model was trained using the Adam optimiser with a learning rate of 0.001. Training was performed for up to 10 epochs with a batch size of 64.
 
 Early stopping was applied using the validation loss from session 4. Training stopped automatically if the validation loss did not improve for three consecutive epochs, helping to reduce overfitting.
 
